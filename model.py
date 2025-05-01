@@ -358,8 +358,8 @@ class MLPBlock(nn.Module):
         self.ffn_hidden_size = self.config.ffn_hidden_size
         self.layer_norm_epsilon = self.config.layer_norm_epsilon
         self.hidden_dropout = self.config.hidden_dropout
-        self.activation = self.config.activation
         
+        # First dense layer
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, ffn_hidden_size]
         self.dense_h_to_4h = DenseLayer(
             in_features=self.hidden_size,
@@ -368,6 +368,7 @@ class MLPBlock(nn.Module):
             dtype=self.config.dtype
         )
         
+        # Second dense layer
         # [batch_size, seq_len, ffn_hidden_size] -> [batch_size, seq_len, hidden_size]
         self.dense_4h_to_h = DenseLayer(
             in_features=self.ffn_hidden_size,
@@ -375,6 +376,16 @@ class MLPBlock(nn.Module):
             use_bias=self.config.bias,
             dtype=self.config.dtype
         )
+
+        # Dropout layer if needed
+        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
+        self.dropout = nn.Dropout(rate=self.hidden_dropout)
+
+        if self.config.activation == "gelu":
+            self.activation = nn.gelu
+        else:
+            self.activation = nn.relu
+
     
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
@@ -385,12 +396,8 @@ class MLPBlock(nn.Module):
             Output tensor of shape [batch_size, seq_len, hidden_size]
         """
         x = self.dense_h_to_4h(x)
-        if self.activation == "gelu":
-            x = nn.gelu(x)
-        else:
-            x = nn.relu(x)
+        x = self.activation(x)
         x = self.dense_4h_to_h(x)
-        x = dropout_add(x, x, dropout_prob=self.hidden_dropout)
 
         return x
 

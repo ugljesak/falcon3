@@ -4,7 +4,7 @@ from transformers.models.falcon.modeling_falcon import (
     FalconMLP,
     FalconAttention,
 )
-from model import merge_heads, split_heads, AttentionLayer 
+from model import merge_heads, split_heads, MLPBlock 
 import jax.numpy as jnp
 import torch
 from utils import compare_results
@@ -22,3 +22,13 @@ x_np = np.random.randn(batch_size, seq_len, hidden_size).astype(np.float32)
 x_jax = jnp.array(x_np)
 x_torch = torch.tensor(x_np)
 
+mlp_jax = MLPBlock(config=config)
+mlp_torch = FalconMLP(config)
+vars = mlp_jax.init(jax.random.PRNGKey(0), x_jax)
+
+vars['params']['dense_h_to_4h']['kernel'] = jnp.array(mlp_torch.dense_h_to_4h.weight.detach().numpy())
+vars['params']['dense_4h_to_h']['kernel'] = jnp.array(mlp_torch.dense_4h_to_h.weight.detach().numpy())
+
+out_jax = mlp_jax.apply(vars, x_jax)
+out_torch = mlp_torch(x_torch)
+compare_results(out_jax, jnp.array(out_torch.detach().numpy()))

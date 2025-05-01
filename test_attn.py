@@ -46,15 +46,15 @@ attn_torch = FalconAttention(config)
 attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
 attention_mask_torch = torch.ones((batch_size, seq_len), dtype=torch.float32)
 position_ids = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
-position_ids_torch = torch.Tensor(position_ids).to(torch.int32)
+position_ids_torch = torch.Tensor(np.array(position_ids)).to(torch.int32)
 variables = attn_jax.init(jax.random.PRNGKey(0), x_jax, attention_mask, position_ids)
 params = variables['params']
 print(f"jax: {params['query_key_value']['kernel'].shape} torch: {attn_torch.query_key_value.weight.shape}")
 print(f"jax: {params['dense']['kernel'].shape} torch: {attn_torch.dense.weight.shape}")
 params['query_key_value']['kernel'] = jnp.array(attn_torch.query_key_value.weight.detach().numpy())
-params['query_key_value']['bias'] = jnp.array(attn_torch.query_key_value.bias.detach().numpy()) if attn_torch.query_key_value.bias is not None else None
+#params['query_key_value']['bias'] = jnp.array(attn_torch.query_key_value.bias.detach().numpy()) if attn_torch.query_key_value.bias is not None else None
 params['dense']['kernel'] = jnp.array(attn_torch.dense.weight.detach().numpy())
-params['dense']['bias'] = jnp.array(attn_torch.dense.bias.detach().numpy()) if attn_torch.dense.bias is not None else None
+#params['dense']['bias'] = jnp.array(attn_torch.dense.bias.detach().numpy()) if attn_torch.dense.bias is not None else None
 
 torch_rope = FalconRotaryEmbedding(config)
 pos_embeddings = torch_rope(x_torch, position_ids_torch)
