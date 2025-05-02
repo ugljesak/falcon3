@@ -26,6 +26,7 @@ from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 from jax.sharding import Mesh as ShardingMesh
 from jax.sharding import PartitionSpec as P
 from configuration_falcon import FalconConfig
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
 class DenseLayer(nn.Module):
     """Linear layer for Falcon model."""
@@ -43,9 +44,8 @@ class DenseLayer(nn.Module):
         else:
             self.bias = None
         
-    @nn.compact
     def __call__(self, x):
-        print(f"dense: x: {x.shape}, weight: {self.weight.shape}")
+        #print(f"dense: x: {x.shape}, weight: {self.weight.shape}")
         out = jnp.matmul(x, self.weight.T)
         if self.use_bias:
             out += self.bias
@@ -112,7 +112,7 @@ class RotaryPositionEmbedding(nn.Module):
 
     def __call__(self, x: jnp.array, position_ids: jnp.array) -> Tuple[jnp.array, jnp.array]:
         """
-        Args:
+        Args:S
             x: Input tensor of shape [batch_size, seq_len, num_heads, head_dim]
             position_ids: Position IDs of shape [batch_size, seq_len]
         Returns:
@@ -323,7 +323,7 @@ class AttentionLayer(nn.Module):
         # [batch_size, num_heads, seq_len, seq_len]
         attention_scores = jnp.matmul(query, key.transpose(0, 1, 3, 2)) 
         attention_scores *= self.inv_norm_factor
-        print(f"Attention shape {attention_scores.shape}")
+        #print(f"Attention shape {attention_scores.shape}")
 
         if attention_mask is not None:
             # [batch_size, 1, 1, seq_len]
@@ -409,8 +409,58 @@ class DecoderLayer(nn.Module):
     def setup(self):
         self.attention = AttentionLayer(self.config, self.layer_idx)
         self.mlp = MLPBlock(self.config)
+        self.dropout = dropout_add
+        self.hidden_dropout = self.config.hidden_dropout
 
-    def __call__(self, hidden_states: jnp.ndarray, attention_mask: jnp.ndarray, position_ids: jnp.ndarray) -> jnp.ndarray:
+        # Layer normalization if using sequential attention
+        # input -> layernorm -> attention ->
+        # -> ?(hidden dropout/add) -> layernorm -> mlp -> output
+        if not self.config.parallel_attn:
+            self.config.num_ln_in_parallel_attn = 1
+            self.input_layernorm = nn.LayerNorm(
+                self.config.layer_norm_epsilon,
+                dtype=self.config.dtype
+            )
+            self.post_attn_layernorm = nn.LayerNorm(
+                self.config.layer_norm_epsilon,
+                dtype=self.config.dtype
+            )
+        # Layer normalization if using parallel attention
+        else:
+            # Default to 2 if not specified
+            if self.config.num_ln_in_parallel_attn is None:
+                self.config.num_ln_in_parallel_attn = 2
+            
+            #                      /-> attention -\
+            # input -> layernorm -<                >-> output
+            #                      \-------> mlp -/
+            if self.config.num_ln_in_parallel_attn == 1:
+                self.input_layernorm = nn.LayerNorm(
+                    self.config.layer_norm_epsilon,
+                    dtype=self.config.dtype
+                )
+            #         /-> layernorm -> attention -\
+            # input -<                             >-> output
+            #         \-> layernorm -------> mlp -/
+            else:
+                self.attn_layernorm = nn.LayerNorm(
+                    self.config.layer_norm_epsilon,
+                    dtype=self.config.dtype
+                )
+                self.mlp_layernorm = nn.LayerNorm(
+                    self.config.layer_norm_epsilon,
+                    dtype=self.config.dtype
+                )
+
+    @nn.compact
+    def __call__(
+        self,
+        hidden_states: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        position_ids: jnp.ndarray,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ) -> jnp.ndarray:
         """
         Args:
             hidden_states (`jnp.ndarray`):
@@ -419,11 +469,70 @@ class DecoderLayer(nn.Module):
                 Attention mask of shape [batch_size, seq_len]
             position_ids (`jnp.ndarray`):
                 Position IDs of shape [batch_size, seq_len]
+            use_cache (`bool`):
+                Whether to use cache for key-value pairs.
+            output_attentions (`bool`):
+                Whether to output attention scores.
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
         """
-        # Self-attention block
-        attention_output, _ = self.attention(hidden_states, attention_mask, position_ids)
-        # Feed-forward block
-        output = self.mlp(attention_output)
-        return output
+        residual = hidden_states
+
+        # Layer normalization before attention
+        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
+        if self.config.parallel_attn and self.config.num_ln_in_parallel_attn == 2:
+            attn_layernorm_out = self.attn_layernorm(hidden_states)
+            mlp_layernorm_out = self.mlp_layernorm(hidden_states)
+        else:
+            attn_layernorm_out = self.input_layernorm(hidden_states)
+
+        # Attention layer
+        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
+        attn_outputs = self.attention(
+            attn_layernorm_out,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            kv_cache=None if not use_cache else {},
+            output_attentions=output_attentions
+        )
+        attention_output = attn_outputs[0]
+
+        if not self.config.parallel_attn:
+            # Residual connection and dropout
+            residual = self.dropout(
+                attention_output,
+                residual,
+                dropout_prob=self.hidden_dropout,
+            )
+            mlp_layernorm_out = self.post_attn_layernorm(residual)
+        elif self.config.num_ln_in_parallel_attn == 1:
+            mlp_layernorm_out = attention_output
+
+        # MLP layer
+        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
+        mlp_output = self.mlp(mlp_layernorm_out)
+
+        if self.config.parallel_attn:
+            mlp_output += attention_output
+
+        output = self.dropout(
+            mlp_output,
+            residual,
+            dropout_prob=self.hidden_dropout,
+        )
+        if output_attentions:
+            # return hidden_states, past_kv, attentions
+            return (output,) + attn_outputs[1:] 
+        else:
+            # return hidden_states, past_kv
+            return (output, attn_outputs[1])
+        
+class FalconPretrainedModel(FlaxPreTrainedModel):
+    """Base class for all Falcon models."""
+    config_class = FalconConfig
+    base_model_prefix = "falcon"
+    supports_gradient_checkpointing = True
+
+    def __init__(self, config: FalconConfig, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.config = config
