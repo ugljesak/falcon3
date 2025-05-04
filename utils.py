@@ -1,7 +1,7 @@
 import jax
 import inspect
-import re
 import jax.numpy as jnp
+from typing import Any, NamedTuple
 
 def compare_results(x, y):
     frame = inspect.currentframe().f_back
@@ -27,3 +27,15 @@ f"""Info for second argument:
     print(f"PCC Score: {jnp.min(jnp.corrcoef(x.flatten(), y.flatten()))}")
     print(f"Max Difference: {jnp.max(jnp.abs(x - y))}")
     print("=" * 50)
+
+class KVCache(NamedTuple):
+    k_cache: jax.Array
+    v_cache: jax.Array
+
+def shift_left_kv_cache(kv_cache: KVCache) -> KVCache:
+    """Shift the key and value cache to the left by one position."""
+    k_cache, v_cache = kv_cache
+    # Shift by -1 (1 to the left) along the second last axis (`seq_len`)
+    k_cache = jnp.roll(k_cache, shift=-1, axis=-2)
+    v_cache = jnp.roll(v_cache, shift=-1, axis=-2)
+    return KVCache(k_cache, v_cache)

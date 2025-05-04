@@ -12,6 +12,7 @@
 import math
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
+import jax
 import flax.linen as nn
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -27,20 +28,25 @@ from jax.sharding import Mesh as ShardingMesh
 from jax.sharding import PartitionSpec as P
 from configuration_falcon import FalconConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from output_models import *
+from utils import KVCache 
 
 class DenseLayer(nn.Module):
     """Linear layer for Falcon model."""
+    config: FalconConfig
     in_features: int
     out_features: int
     use_bias: bool = False
     dtype: jnp.dtype = jnp.float32
-    kernel_init: Callable = nn.initializers.normal(stddev=0.02)
-    bias_init: Callable = nn.initializers.normal(stddev=0.02)
-    
-    def setup(self):
-        self.weight = self.param('kernel', self.kernel_init, (self.out_features, self.in_features))
+
+    def setup(self, kernel_init: Callable = None, bias_init: Callable = None):
+        if kernel_init is None:
+            kernel_init = nn.initializers.normal(stddev=self.config.initializer_range)
+        if bias_init is None:
+            bias_init = nn.initializers.zeros
+        self.weight = self.param('kernel', kernel_init, (self.out_features, self.in_features))
         if self.use_bias:
-            self.bias = self.param('bias', self.bias_init, (self.out_features,))
+            self.bias = self.param('bias', bias_init, (self.out_features,))
         else:
             self.bias = None
         
@@ -51,12 +57,12 @@ class DenseLayer(nn.Module):
             out += self.bias
         return out
     
-def rotate_by_quarter(x: jnp.ndarray) -> jnp.ndarray:
+def rotate_by_quarter(x: jax.Array) -> jax.Array:
     """
     Rotate the last dimension of x by pi/4 (90 degrees).
     
     Args:
-        x (`jnp.ndarray`):
+        x (`jax.Array`):
             Input tensor of shape [batch_size, seq_len, dim]
             or [batch_size, seq_len, num_heads, head_dim]
     Returns:
@@ -67,23 +73,23 @@ def rotate_by_quarter(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.concatenate([-x2, x1], axis=-1)
 
 def apply_rotary_pos_emb(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    cos: jnp.ndarray,
-    sin: jnp.ndarray,
+    q: jax.Array,
+    k: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
     unsqueeze_dim: int = 1
-) -> jnp.ndarray:
+) -> jax.Array:
     """
     Apply rotary position embedding to x.
     
     Args:
-        q (`jnp.ndarray`):
+        q (`jax.Array`):
             Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
-        k (`jnp.ndarray`):
+        k (`jax.Array`):
             Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
-        cos (`jnp.ndarray`):
+        cos (`jax.Array`):
             Cosine tensor of shape [batch_size, seq_len, hidden_size]
-        sin (`jnp.ndarray`):
+        sin (`jax.Array`):
             Sine tensor of shape [batch_size, seq_len, hidden_size]
         unsqueeze_dim (`int`):
             Dimension to unsqueeze for cos and sin tensors
@@ -110,11 +116,13 @@ class RotaryPositionEmbedding(nn.Module):
         self.dim = int(head_dim * partial_rotary_factor)
         self.inv_freq = 1.0 / (self.config.rope_theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.int32) / self.dim))
 
-    def __call__(self, x: jnp.array, position_ids: jnp.array) -> Tuple[jnp.array, jnp.array]:
+    def __call__(self, x: jax.Array, position_ids: jax.Array) -> Tuple[jax.Array, jax.Array]:
         """
         Args:S
-            x: Input tensor of shape [batch_size, seq_len, num_heads, head_dim]
-            position_ids: Position IDs of shape [batch_size, seq_len]
+            x(`jax.Array`): 
+                Input tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            position_ids (`jax.Array`):
+                Position IDs of shape [batch_size, seq_len]
         Returns:
             Tuple of cos and sin tensors for rotary embeddings
         """
@@ -135,11 +143,11 @@ class RotaryPositionEmbedding(nn.Module):
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 def dropout_add(
-    x: jnp.ndarray,
-    residual: jnp.ndarray,
+    x: jax.Array,
+    residual: jax.Array,
     dropout_prob: float = 0.0,
     training: bool = False
-) -> jnp.ndarray:
+) -> jax.Array:
     """
     Applies dropout and adds residual.
     
@@ -156,23 +164,23 @@ def dropout_add(
     out = out + residual
     return out
 
-def split_heads(fused_qkv: jnp.ndarray, config: FalconConfig) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Split the last dimension into (num_heads, head_dim),
     while output shares same memory as `fused_qkv`.
     
     Args:
-        qkv(`jnp.ndarray`):
+        qkv(`jax.Array`):
             Input tensor of shape [batch_size, seq_len, qkv_out_dim]
         config(`FalconConfig`):
             Configuration object for Falcon model              
     
     Returns:
-        query('jnp.ndarray'):
+        query('jax.Array'):
             Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
-        key('jnp.ndarray'):
+        key('jax.Array'):
             Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
-        value('jnp.ndarray'):
+        value('jax.Array'):
             Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
     """
     batch_size, seq_len, _ = fused_qkv.shape
@@ -194,12 +202,12 @@ def split_heads(fused_qkv: jnp.ndarray, config: FalconConfig) -> Tuple[jnp.ndarr
         qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_heads, 3, config.head_dim))
         return qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
 
-def merge_heads(x: jnp.ndarray, config: FalconConfig) -> jnp.ndarray:
+def merge_heads(x: jax.Array, config: FalconConfig) -> jax.Array:
     """
     Merge head together over the last dimension.
 
     Args:
-        x(`jnp.ndarray`):
+        x(`jax.Array`):
             Input tensor of shape [batch_size * num_heads, seq_len, head_dim]
         config(`FalconConfig`):
             Configuration object for Falcon model
@@ -259,6 +267,7 @@ class AttentionLayer(nn.Module):
         # Create QKV projection
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, qkv_out_dim]
         self.query_key_value = DenseLayer(
+            config=self.config,
             in_features=self.hidden_size,
             out_features=qkv_out_dim,
             use_bias=self.config.bias,
@@ -267,6 +276,7 @@ class AttentionLayer(nn.Module):
         # Create output projection
         # [..., hidden_size] -> [..., hidden_size]
         self.dense = DenseLayer(
+            config=self.config,
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             use_bias=self.config.bias,
@@ -278,21 +288,24 @@ class AttentionLayer(nn.Module):
     
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        position_ids: jnp.ndarray,
-        kv_cache: Optional[Dict[str, jnp.ndarray]] = None,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array,
+        position_ids: jax.Array,
+        use_cache: bool = True,
+        kv_cache: Optional[KVCache] = None,
+        cache_position: Optional[jax.Array] = None,
+        position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
         output_attentions: bool = False
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
+    ) -> Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
         """
         Args:
-            hidden_states (`jnp.ndarray`):
+            hidden_states (`jax.Array`):
                 Input tensor of shape [batch_size, seq_len, hidden_size]
-            attention_mask (`jnp.ndarray`):
+            attention_mask (`jax.Array`):
                 Attention mask of shape [batch_size, seq_len]
-            position_ids (`jnp.ndarray`):
+            position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
-            kv_cache (`Dict[str, jnp.ndarray]`, *optional*):
+            kv_cache (`Dict[str, jax.Array]`, *optional*):
                 Key-Value cache for past key-value pairs
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
@@ -308,15 +321,19 @@ class AttentionLayer(nn.Module):
         key = jnp.reshape(key, (batch_size, self.num_heads, seq_len, self.head_dim))
         value = jnp.reshape(value, (batch_size, self.num_heads, seq_len, self.head_dim))
 
-        cos, sin = self.rope(hidden_states, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rope(hidden_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
+        
+        # Use cached key and value if available
+        if use_cache and kv_cache is not None:
+            assert hidden_states.shape[1] == kv_cache["key"].shape[2], f"Key shape mismatch: {hidden_states.shape[1]} vs {kv_cache['key'].shape[2]}"
+            k_cache, v_cache = kv_cache
 
-        if kv_cache is not None:
-            # Use cached key and value if available
-            key = jnp.concatenate([kv_cache["key"], key], axis=2)
-            value = jnp.concatenate([kv_cache["value"], value], axis=2)
-            kv_cache["key"] = key
-            kv_cache["value"] = value
+            key = k_cache[:, :, -1:].set(key)
+            value = v_cache[:, :, -1:].set(value)
         
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -342,12 +359,20 @@ class AttentionLayer(nn.Module):
         # [batch_size, seq_len, hidden_size]
         attention_output = jnp.reshape(attention_output, (batch_size, seq_len, self.hidden_size))
 
+        # Apply final dense layer
+        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
         attention_output = self.dense(attention_output)
 
+        # Update cache with new key-value pairs
+        kv_cache = KVCache(key, value)
+
+        outputs = (attention_output,)
+        if use_cache:
+            outputs += (kv_cache,)
         if output_attentions:
-            return attention_output, kv_cache, attention_scores
-        else:
-            return attention_output, kv_cache
+            outputs += (attention_scores,)
+
+        return outputs
         
 class MLPBlock(nn.Module):
     """Feed-forward layer for Falcon model."""
@@ -362,6 +387,7 @@ class MLPBlock(nn.Module):
         # First dense layer
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, ffn_hidden_size]
         self.dense_h_to_4h = DenseLayer(
+            config=self.config,
             in_features=self.hidden_size,
             out_features=self.ffn_hidden_size,
             use_bias=self.config.bias,
@@ -371,6 +397,7 @@ class MLPBlock(nn.Module):
         # Second dense layer
         # [batch_size, seq_len, ffn_hidden_size] -> [batch_size, seq_len, hidden_size]
         self.dense_4h_to_h = DenseLayer(
+            config=self.config,
             in_features=self.ffn_hidden_size,
             out_features=self.hidden_size,
             use_bias=self.config.bias,
@@ -387,10 +414,10 @@ class MLPBlock(nn.Module):
             self.activation = nn.relu
 
     
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jax.Array) -> jax.Array:
         """
         Args:
-            x (`jnp.ndarray`):
+            x (`jax.Array`):
                 Input tensor of shape [batch_size, seq_len, hidden_size]
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
@@ -455,19 +482,19 @@ class DecoderLayer(nn.Module):
     @nn.compact
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        position_ids: jnp.ndarray,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array,
+        position_ids: jax.Array,
         use_cache: bool = False,
         output_attentions: bool = False,
-    ) -> jnp.ndarray:
+    ) -> jax.Array:
         """
         Args:
-            hidden_states (`jnp.ndarray`):
+            hidden_states (`jax.Array`):
                 Input tensor of shape [batch_size, seq_len, hidden_size]
-            attention_mask (`jnp.ndarray`):
+            attention_mask (`jax.Array`):
                 Attention mask of shape [batch_size, seq_len]
-            position_ids (`jnp.ndarray`):
+            position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
             use_cache (`bool`):
                 Whether to use cache for key-value pairs.
@@ -527,8 +554,8 @@ class DecoderLayer(nn.Module):
             # return hidden_states, past_kv
             return (output, attn_outputs[1])
         
-class FalconPretrainedModel(FlaxPreTrainedModel):
-    """Base class for all Falcon models."""
+class FalconPreTrainedModel(FlaxPreTrainedModel):
+    """Derivative for falcon pretrained model."""
     config_class = FalconConfig
     base_model_prefix = "falcon"
     supports_gradient_checkpointing = True
@@ -536,3 +563,246 @@ class FalconPretrainedModel(FlaxPreTrainedModel):
     def __init__(self, config: FalconConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
+
+    def _init_weights(self, module: nn.Module):
+        """Initialize the weights of the model."""
+        if isinstance(module, DenseLayer) or isinstance(module, nn.Dense):
+            module.kernel_init = nn.initializers.normal(stddev=self.config.initializer_range)
+            module.bias_init = nn.initializers.zeros
+        elif isinstance(module, nn.LayerNorm):
+            module.bias_init = nn.initializers.zeros
+            module.weight_init = nn.initializers.ones
+        elif isinstance(module, nn.Embed):
+            module.embedding_init = nn.initializers.normal(stddev=self.config.initializer_range)
+        else:
+            raise ValueError(f"Unknown module type: {type(module)}")
+
+class FalconModel(FalconPreTrainedModel):
+    """Base class for all Falcon models."""
+    def __init__(self, config: FalconConfig, *args, **kwargs):
+        super.__init__(config, *args, **kwargs)
+
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        
+        # Set up the embedding layer to transform input tokens into embeddings
+        self.word_embeddings = nn.Embed(
+            num_embeddings=config.vocab_size,
+            features=self.embed_dim,
+            embedding_init=nn.initializers.xavier_uniform(),
+            dtype=config.dtype
+        )
+
+        # Set up the transformer blocks
+        self.blocks = [DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+
+        # Set up final layer normalization
+        self.final_layer_norm = nn.LayerNorm(
+            epsilon=config.layer_norm_epsilon,
+            dtype=config.dtype
+        )
+
+        self.rotary_emb = RotaryPositionEmbedding(config=config)
+        
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.word_embeddings
+    
+    def set_input_embeddings(self, new_embeddings: jax.Array):
+        self.word_embeddings = new_embeddings
+
+    def forward(
+        self,
+        input_ids: Optional[jax.Array] = None,
+        input_embeds: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
+        position_ids: Optional[jax.Array] = None,
+        head_mask: Optional[jax.Array] = None,
+        kv_cache: Optional[Dict[str, jax.Array]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """
+        Args:
+            input_ids (`jax.Array`):
+                Input tensor of shape [batch_size, seq_len]
+            input_embeds (`jax.Array`):
+                Input tensor of shape [batch_size, seq_len, hidden_size]
+            attention_mask (`jax.Array`):
+                Attention mask of shape [batch_size, seq_len]
+            position_ids (`jax.Array`):
+                Position IDs of shape [batch_size, seq_len]
+            head_mask (`jax.Array`):
+                Mask for attention heads of shape [num_layers, num_heads]
+            kv_cache (`Dict[str, jax.Array]`, *optional*):
+                Key-Value cache for past key-value pairs
+            use_cache (`bool`):
+                Whether to use cache for key-value pairs.
+            output_attentions (`bool`):
+                Whether to output attention scores.
+            output_hidden_states (`bool`):
+                Whether to output hidden states.
+            return_dict (`bool`):
+                Whether to return a dictionary or a tuple.
+        Returns:
+            Output tensor of shape [batch_size, seq_len, hidden_size]
+        """
+        
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if (input_ids is None) ^ (input_embeds is None):
+            raise ValueError("You have to specify exactly one of input_ids or input_embeds.")
+        
+        if input_embeds is None:
+            input_embeds = self.word_embeddings(input_ids)
+
+        # TODO: Cache
+
+        casual_mask = None
+
+        hidden_states = input_embeds
+
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        for i, block in enumerate(self.blocks):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            # Apply attention block
+            outputs = block(
+                hidden_states=hidden_states,
+                attention_mask=casual_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+                head_mask=head_mask[i],
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                position_embeddings=position_embeddings
+            )
+
+            hidden_states = outputs[0]
+            if use_cache:
+                next_decoder_cache = outputs[1]
+            
+            if output_attentions:
+                all_self_attentions += (outputs[2],)
+
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = next_decoder_cache if use_cache else None
+        
+        if not return_dict:
+            return Tuple( v for v in
+                [hidden_states, next_cache, all_hidden_states, all_self_attentions] 
+                if v is not None)
+        else:
+            return BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attentions
+            )
+        
+class FalconForCausalLM(FalconPreTrainedModel):
+    """Falcon model for causal language modeling."""
+
+    def __init__(self, config: FalconConfig, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        
+        # Set up the model
+        self.transformer = FalconModel(config)
+        
+        # Set up the lm head
+        self.lm_head = DenseLayer(
+            config=config,
+            in_features=config.hidden_size,
+            out_features=config.vocab_size,
+            use_bias=False,
+            dtype=config.dtype
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.lm_head
+    
+    def set_output_embeddings(self, new_embeddings: jax.Array):
+        self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
+        position_ids: Optional[jax.Array] = None,
+        head_mask: Optional[jax.Array] = None,
+        kv_cache: Optional[Dict[str, jax.Array]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: Optional[jax.Array] = None,
+        logits_to_keep: Union[int, jax.Array] = 0,
+        **kwargs
+    ) -> Union[Tuple[jax.Array], CausalLMOutputWithCrossAttentions]:
+        """
+        Args:
+            All from FalconModel forward method.
+            
+            labels (`jax.Array`, *optional*):
+                Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
+                `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
+                are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+            
+            logits_to_keep (`int`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `jax.Array`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+        Returns:
+            Output tensor of shape [batch_size, seq_len, vocab_size]
+        """
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # Call the transformer model
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            kv_cache=kv_cache,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = transformer_outputs.last_hidden_state
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        lm_logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        if not return_dict:
+            return (lm_logits,) + transformer_outputs[1:]
+
+        return CausalLMOutputWithCrossAttentions(
+            logits=lm_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
