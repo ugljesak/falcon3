@@ -202,32 +202,6 @@ def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, 
         qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_heads, 3, config.head_dim))
         return qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
 
-def merge_heads(x: jax.Array, config: FalconConfig) -> jax.Array:
-    """
-    Merge head together over the last dimension.
-
-    Args:
-        x(`jax.Array`):
-            Input tensor of shape [batch_size * num_heads, seq_len, head_dim]
-        config(`FalconConfig`):
-            Configuration object for Falcon model
-    
-    Returns:
-        Merged tensor of shape [batch_size, seq_len, num_heads * head_dim]
-    """
-    # We want to achieve:
-    # [batch_size * num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads * head_dim]
-    num_heads = config.num_attention_heads
-    batch_size_and_num_heads, seq_len, _ = x.shape
-    batch_size = batch_size_and_num_heads // num_heads
-    # [batch_size, num_heads, seq_len, head_dim]
-    x = x.reshape(batch_size, num_heads, seq_len, config.head_dim)
-    # [batch_size, seq_len, num_heads, head_dim]
-    x = x.transpose(0, 2, 1, 3)
-    # [batch_size, seq_len, num_heads * head_dim]
-    x = x.reshape(batch_size, seq_len, -1)
-    return x
-
 class AttentionLayer(nn.Module):
     """Multi-head Attention layer for Falcon model."""
     config: FalconConfig
@@ -293,7 +267,7 @@ class AttentionLayer(nn.Module):
         position_ids: jax.Array,
         use_cache: bool = True,
         kv_cache: Optional[KVCache] = None,
-        cache_position: Optional[jax.Array] = None,
+        head_mask: Optional[jax.Array] = None,
         position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
         output_attentions: bool = False
     ) -> Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
@@ -305,10 +279,24 @@ class AttentionLayer(nn.Module):
                 Attention mask of shape [batch_size, seq_len]
             position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
+            use_cache (`bool`):
+                Whether to use key-value cache for faster decoding
             kv_cache (`Dict[str, jax.Array]`, *optional*):
                 Key-Value cache for past key-value pairs
+            head_mask (`jax.Array`, *optional*):
+                Mask for attention heads of size [batch_size, num_heads, seq_len, seq_len]
+            cache_position (`jax.Array`, *optional*):
+                Position IDs for cache
+            position_embeddings (`Tuple[jax.Array, jax.Array]`, *optional*):
+                Cos and sin tensors for rotary embeddings
+            output_attentions (`bool`):
+                Whether to return attention scores
+        
         Returns:
-            Output tensor of shape [batch_size, seq_len, hidden_size]
+            Output tuple consisting of:
+                Tensor of shape [batch_size, seq_len, hidden_size]
+                Optional key-value cache for past key-value pairs
+                Optional attention scores of shape [batch_size, num_heads, seq_len, seq_len]
         """
         # [batch_size, seq_len, qkv_out_dim]
         fused_qkv = self.query_key_value(hidden_states)
@@ -349,11 +337,17 @@ class AttentionLayer(nn.Module):
             attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, seq_len))
         
         # Apply attention mask
-        attention_scores = nn.softmax(attention_scores + attention_mask, axis=-1)
-        attention_output = jnp.matmul(attention_scores, value)
+        attention_probs = nn.softmax(attention_scores + attention_mask, axis=-1)
+        # Apply dropout if needed
+        attention_probs = self.attention_dropout(attention_probs)
+        # Apply head_mask
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
 
+        # [batch_size, num_heads, seq_len, seq_len] @
+        # [batch_size, num_heads, seq_len, head_dim] =
         # [batch_size, num_heads, seq_len, head_dim]
-        attention_output = jnp.reshape(attention_output, (batch_size, self.num_heads, seq_len, self.head_dim))
+        attention_output = jnp.matmul(attention_probs, value)
         # [batch_size, seq_len, num_heads, head_dim]
         attention_output = jnp.transpose(attention_output, (0, 2, 1, 3))
         # [batch_size, seq_len, hidden_size]
@@ -485,8 +479,11 @@ class DecoderLayer(nn.Module):
         hidden_states: jax.Array,
         attention_mask: jax.Array,
         position_ids: jax.Array,
+        head_mask: Optional[jax.Array] = None,
         use_cache: bool = False,
+        kv_cache: Optional[KVCache] = None,
         output_attentions: bool = False,
+        position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
     ) -> jax.Array:
         """
         Args:
@@ -519,8 +516,11 @@ class DecoderLayer(nn.Module):
             attn_layernorm_out,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            kv_cache=None if not use_cache else {},
-            output_attentions=output_attentions
+            head_mask=head_mask,
+            use_cache=use_cache,
+            kv_cache=kv_cache if use_cache else None,
+            output_attentions=output_attentions,
+            position_embeddings=position_embeddings
         )
         attention_output = attn_outputs[0]
 
@@ -576,6 +576,37 @@ class FalconPreTrainedModel(FlaxPreTrainedModel):
             module.embedding_init = nn.initializers.normal(stddev=self.config.initializer_range)
         else:
             raise ValueError(f"Unknown module type: {type(module)}")
+
+def configure_head_mask(head_mask : Optional[jax.Array], num_hidden_layers: int) -> jax.Array:
+    """
+    Prepares the head mask for the model.
+
+    Args:
+        head_mask (`jax.Array`):
+            Mask for attention heads of shape [num_heads] or [num_layers, num_heads]
+        num_hidden_layers (`int`):
+            Number of hidden layers in the model
+
+    Returns:
+        head_mask (`jax.Array`):
+            Mask for attention heads of shape [num_layers, batch_size, num_heads, seq_len, seq_len]
+    """
+    if head_mask is None:
+        return [None] * num_hidden_layers
+
+    if head_mask.ndim == 1:
+        # [num_heads] -> [1, 1, num_heads, 1, 1]
+        head_mask = head_mask[None, None, :, None, None]
+        print(f"head_mask shape: {head_mask.shape}")
+        # [1, 1, num_heads, 1, 1] -> [num_layers, 1, num_heads, 1, 1]
+        head_mask = jnp.broadcast_to(head_mask, (num_hidden_layers, 1, head_mask.shape[2], 1, 1))
+    
+    elif head_mask.ndim == 2:
+        # [num_layers, num_heads] -> [num_layers, 1, num_heads, 1, 1]
+        head_mask = head_mask[:, None, :, None, None]
+        
+    return head_mask
+
 
 class FalconModel(FalconPreTrainedModel):
     """Base class for all Falcon models."""
@@ -637,7 +668,7 @@ class FalconModel(FalconPreTrainedModel):
             position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
             head_mask (`jax.Array`):
-                Mask for attention heads of shape [num_layers, num_heads]
+                Mask for attention heads of shape [num_heads] or [num_layers, num_heads]
             kv_cache (`Dict[str, jax.Array]`, *optional*):
                 Key-Value cache for past key-value pairs
             use_cache (`bool`):
@@ -668,6 +699,7 @@ class FalconModel(FalconPreTrainedModel):
         casual_mask = None
 
         hidden_states = input_embeds
+        head_mask = configure_head_mask(head_mask, self.config.num_hidden_layers)
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_self_attentions = () if output_attentions else None
