@@ -16,7 +16,9 @@ config = FalconConfig(
     num_kv_heads=1,
     num_attention_heads=30,
     hidden_size=480,
-    num_hidden_layers=4
+    num_hidden_layers=4,
+    num_ln_in_parallel_attn=2,
+    parallel_attn=True,
 )
 
 batch_size = 8

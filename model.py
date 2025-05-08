@@ -29,6 +29,7 @@ from jax.sharding import PartitionSpec as P
 from configuration_falcon import FalconConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from output_models import *
+from transformers.cache_utils import Cache
 from utils import KVCache 
 
 class DenseLayer(nn.Module):
@@ -268,6 +269,7 @@ class AttentionLayer(nn.Module):
         use_cache: bool = True,
         kv_cache: Optional[KVCache] = None,
         head_mask: Optional[jax.Array] = None,
+        cache_position: Optional[jax.Array] = None,
         position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
         output_attentions: bool = False
     ) -> Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
@@ -316,12 +318,10 @@ class AttentionLayer(nn.Module):
         query, key = apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
         
         # Use cached key and value if available
-        if use_cache and kv_cache is not None:
-            assert hidden_states.shape[1] == kv_cache["key"].shape[2], f"Key shape mismatch: {hidden_states.shape[1]} vs {kv_cache['key'].shape[2]}"
-            k_cache, v_cache = kv_cache
-
-            key = k_cache[:, :, -1:].set(key)
-            value = v_cache[:, :, -1:].set(value)
+        if use_cache:
+            if kv_cache is None:
+                kv_cache = KVCache(self.config)
+            key, value = kv_cache.update(key, value, cache_position, cos, sin)
         
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -356,9 +356,6 @@ class AttentionLayer(nn.Module):
         # Apply final dense layer
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
         attention_output = self.dense(attention_output)
-
-        # Update cache with new key-value pairs
-        kv_cache = KVCache(key, value)
 
         outputs = (attention_output,)
         if use_cache:
@@ -482,6 +479,7 @@ class DecoderLayer(nn.Module):
         head_mask: Optional[jax.Array] = None,
         use_cache: bool = False,
         kv_cache: Optional[KVCache] = None,
+        cache_position: Optional[jax.Array] = None,
         output_attentions: bool = False,
         position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
     ) -> jax.Array:
@@ -493,10 +491,19 @@ class DecoderLayer(nn.Module):
                 Attention mask of shape [batch_size, seq_len]
             position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
+            head_mask (`jax.Array`, *optional*):
+                Mask for attention heads of size [batch_size, num_heads, seq_len, seq_len]
             use_cache (`bool`):
                 Whether to use cache for key-value pairs.
+            kv_cache (`Dict[str, jax.Array]`, *optional*):
+                Key-Value cache for past key-value pairs
+            cache_position (`jax.Array`, *optional*):
+                Position IDs for cache
             output_attentions (`bool`):
                 Whether to output attention scores.
+            position_embeddings (`Tuple[jax.Array, jax.Array]`, *optional*):
+                Cos and sin tensors for rotary embeddings
+
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
         """
@@ -519,6 +526,7 @@ class DecoderLayer(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             kv_cache=kv_cache if use_cache else None,
+            cache_position=cache_position,
             output_attentions=output_attentions,
             position_embeddings=position_embeddings
         )
@@ -607,6 +615,51 @@ def configure_head_mask(head_mask : Optional[jax.Array], num_hidden_layers: int)
         
     return head_mask
 
+def update_causal_mask(
+    config: FalconConfig,
+    attention_mask: jax.Array,
+    cache_position: jax.Array,
+):
+    """
+    Update the causal mask for the model.
+
+    Args:
+        attention_mask (`jax.Array`):
+            Attention mask of shape [batch_size, seq_len] or [batch_size, 1, query_lenght, kv_length]
+        cache_position (`jax.Array`):
+            Position IDs for cache
+        past_key_values (`KVCache`):
+            Key-Value cache for past key-value pairs
+
+    Returns:
+        Updated attention mask of shape [batch_size, 1, 1, seq_len]
+    """
+    if attention_mask is not None and attention_mask.ndim == 4:
+        return attention_mask
+
+    target_length = config.max_position_embeddings
+    batch_size, seq_len = attention_mask.shape
+    min_dtype = jnp.finfo(config.dtype).min
+    causal_mask = jnp.full((batch_size, target_length), fill_value=min_dtype, dtype=config.dtype)
+    if seq_len != 1:
+        causal_mask = jnp.triu(causal_mask, k=1)
+
+    causal_mask *= jnp.arange(target_length)[None, :] > cache_position[:, None]
+    causal_mask = causal_mask[None, None, :, :]
+    causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, target_length))
+    
+    if attention_mask is not None:
+        mask_length = attention_mask.shape[-1]
+        
+        padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+        padding_mask = padding_mask == 0
+        
+        causal_mask = causal_mask.at[:, :, :, :mask_length].set(
+            jnp.where(padding_mask, min_dtype, causal_mask[:, :, :, :mask_length])
+        )
+
+    return causal_mask
+
 
 class FalconModel(FalconPreTrainedModel):
     """Base class for all Falcon models."""
@@ -653,6 +706,7 @@ class FalconModel(FalconPreTrainedModel):
         head_mask: Optional[jax.Array] = None,
         kv_cache: Optional[Dict[str, jax.Array]] = None,
         use_cache: Optional[bool] = None,
+        cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -673,6 +727,8 @@ class FalconModel(FalconPreTrainedModel):
                 Key-Value cache for past key-value pairs
             use_cache (`bool`):
                 Whether to use cache for key-value pairs.
+            cache_position (`jax.Array`, *optional*):
+                Position IDs for cache
             output_attentions (`bool`):
                 Whether to output attention scores.
             output_hidden_states (`bool`):
@@ -694,9 +750,18 @@ class FalconModel(FalconPreTrainedModel):
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
 
-        # TODO: Cache
+        past_kv_len = kv_cache["key"].shape[-2] if kv_cache is not None else 0
+        if cache_position is None:
+            cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
+        
+        if position_ids is None:
+            position_ids = cache_position[None, :]
 
-        casual_mask = None
+        causal_mask = update_causal_mask(
+            self.config,
+            attention_mask=attention_mask,
+            cache_position=cache_position
+        )
 
         hidden_states = input_embeds
         head_mask = configure_head_mask(head_mask, self.config.num_hidden_layers)
@@ -712,22 +777,26 @@ class FalconModel(FalconPreTrainedModel):
             # Apply attention block
             outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=casual_mask,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
-                kv_cache=kv_cache,
-                head_mask=head_mask[i],
                 use_cache=use_cache,
+                kv_cache=kv_cache,
+                cache_position=cache_position,
+                head_mask=head_mask[i],
                 output_attentions=output_attentions,
                 position_embeddings=position_embeddings
             )
 
+            # Unpack outputs
             hidden_states = outputs[0]
+            # Update cache if needed
             if use_cache:
                 next_decoder_cache = outputs[1]
-            
+            # Store attention scores if needed for every layer
             if output_attentions:
                 all_self_attentions += (outputs[2],)
 
+        # Apply final layer normalization
         hidden_states = self.final_layer_norm(hidden_states)
 
         if output_hidden_states:
