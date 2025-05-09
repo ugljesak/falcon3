@@ -562,16 +562,14 @@ class DecoderLayer(nn.Module):
             # return hidden_states, past_kv
             return (output, attn_outputs[1])
         
-class FalconPreTrainedModel(FlaxPreTrainedModel):
+class FalconPreTrainedModel(nn.Module):
     """Derivative for falcon pretrained model."""
-    config_class = FalconConfig
-    base_model_prefix = "falcon"
-    supports_gradient_checkpointing = True
+    config: FalconConfig 
+    base_model_prefix: str = "falcon"
 
-    def __init__(self, config: FalconConfig, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
-        self.config = config
-
+    def __init__(self):
+        pass
+        
     def _init_weights(self, module: nn.Module):
         """Initialize the weights of the model."""
         if isinstance(module, DenseLayer) or isinstance(module, nn.Dense):
@@ -663,33 +661,32 @@ def update_causal_mask(
 
 class FalconModel(FalconPreTrainedModel):
     """Base class for all Falcon models."""
-    def __init__(self, config: FalconConfig, *args, **kwargs):
-        super.__init__(config, *args, **kwargs)
+    config: FalconConfig
 
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
+    def setup(self):
+        
+        self.embed_dim = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
         
         # Set up the embedding layer to transform input tokens into embeddings
         self.word_embeddings = nn.Embed(
-            num_embeddings=config.vocab_size,
+            num_embeddings=self.config.vocab_size,
             features=self.embed_dim,
             embedding_init=nn.initializers.xavier_uniform(),
-            dtype=config.dtype
+            dtype=self.config.dtype
         )
 
         # Set up the transformer blocks
-        self.blocks = [DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        self.blocks = [DecoderLayer(self.config, layer_idx=i) for i in range(self.config.num_hidden_layers)]
 
         # Set up final layer normalization
         self.final_layer_norm = nn.LayerNorm(
-            epsilon=config.layer_norm_epsilon,
-            dtype=config.dtype
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=self.config.dtype
         )
 
-        self.rotary_emb = RotaryPositionEmbedding(config=config)
+        self.rotary_emb = RotaryPositionEmbedding(config=self.config)
         
-        # Initialize weights and apply final processing
-        self.post_init()
 
     def get_input_embeddings(self):
         return self.word_embeddings
@@ -697,7 +694,7 @@ class FalconModel(FalconPreTrainedModel):
     def set_input_embeddings(self, new_embeddings: jax.Array):
         self.word_embeddings = new_embeddings
 
-    def forward(
+    def __call__(
         self,
         input_ids: Optional[jax.Array] = None,
         input_embeds: Optional[jax.Array] = None,
@@ -820,7 +817,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
     """Falcon model for causal language modeling."""
 
     def __init__(self, config: FalconConfig, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
+        super.__init__(config, *args, **kwargs)
         
         # Set up the model
         self.transformer = FalconModel(config)
@@ -833,9 +830,6 @@ class FalconForCausalLM(FalconPreTrainedModel):
             use_bias=False,
             dtype=config.dtype
         )
-
-        # Initialize weights and apply final processing
-        self.post_init()
 
     def get_output_embeddings(self):
         return self.lm_head

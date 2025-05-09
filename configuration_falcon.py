@@ -2,10 +2,11 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, Optional
 
+from transformers import PretrainedConfig
 from jax import numpy as jnp
 
 @dataclass
-class FalconConfig:
+class FalconConfig(PretrainedConfig):
     """Configuration class for Falcon model."""
     vocab_size: int = 65024
     hidden_size: int = 4544
@@ -32,9 +33,16 @@ class FalconConfig:
     _attn_implementation: str = "eager"
     ffn_hidden_size: Optional[int] = None
     dtype: jnp.dtype = jnp.float32
-    
+    # Depricated attributes
+    alibi: Optional[bool] = None
+    pruned_heads = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.__post_init__()
+
     def __post_init__(self):
-        
+
         if self.head_dim * self.num_heads != self.hidden_size:
             raise ValueError(f"Hidden size {self.hidden_size} must be divisible by number of attention heads {self.num_heads}.")
         if self.num_heads % self.num_kv_heads != 0:

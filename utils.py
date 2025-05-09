@@ -28,7 +28,7 @@ f"""Info for second argument:
     print(f"Max Difference: {jnp.max(jnp.abs(x - y))}")
     print("=" * 50)
 
-class KVCache(NamedTuple):
+class KVCache():
     k_cache: jax.Array
     v_cache: jax.Array
 
