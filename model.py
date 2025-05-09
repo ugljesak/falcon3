@@ -635,14 +635,17 @@ def update_causal_mask(
     if attention_mask is not None and attention_mask.ndim == 4:
         return attention_mask
 
+    # Attention mask: [batch_size, seq_len]
     target_length = config.max_position_embeddings
     batch_size, seq_len = attention_mask.shape
     min_dtype = jnp.finfo(config.dtype).min
+    print(f"min_dtype: {min_dtype}, attention_mask shape: {attention_mask.shape}")
     causal_mask = jnp.full((batch_size, target_length), fill_value=min_dtype, dtype=config.dtype)
+    print(f"causal_mask shape: {causal_mask.shape}")
     if seq_len != 1:
         causal_mask = jnp.triu(causal_mask, k=1)
-
-    causal_mask *= jnp.arange(target_length)[None, :] > cache_position[:, None]
+    print(f"cache_position shape: {cache_position.shape}")
+    causal_mask *= jnp.arange(target_length)[None, None, :].repeat(batch_size, axis=0) > cache_position[None, :, None].repeat(batch_size, axis=0)
     causal_mask = causal_mask[None, None, :, :]
     causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, target_length))
     
@@ -664,7 +667,7 @@ class FalconModel(FalconPreTrainedModel):
     config: FalconConfig
 
     def setup(self):
-        
+
         self.embed_dim = self.config.hidden_size
         self.num_heads = self.config.num_attention_heads
         
