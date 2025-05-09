@@ -257,7 +257,7 @@ class AttentionLayer(nn.Module):
             use_bias=self.config.bias,
             dtype=self.config.dtype
         )
-        self.attention_dropout = nn.Dropout(rate=self.config.attention_dropout)
+        self.attention_dropout = nn.Dropout(rate=self.config.attention_dropout, deterministic=False)
 
     
     
@@ -300,6 +300,7 @@ class AttentionLayer(nn.Module):
                 Optional key-value cache for past key-value pairs
                 Optional attention scores of shape [batch_size, num_heads, seq_len, seq_len]
         """
+        print(f"AttentionLayer: hidden_states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape}, position_ids shape: {position_ids.shape}")
         # [batch_size, seq_len, qkv_out_dim]
         fused_qkv = self.query_key_value(hidden_states)
         (query, key, value) = split_heads(fused_qkv, self.config)
@@ -320,8 +321,9 @@ class AttentionLayer(nn.Module):
         # Use cached key and value if available
         if use_cache:
             if kv_cache is None:
-                kv_cache = KVCache(self.config)
-            key, value = kv_cache.update(key, value, cache_position, cos, sin)
+                kv_cache = KVCache(self.config, batch_size, key, value)
+            else:
+                key, value = kv_cache.update(key, value, cache_position, cos, sin)
         
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -330,9 +332,12 @@ class AttentionLayer(nn.Module):
         attention_scores *= self.inv_norm_factor
         #print(f"Attention shape {attention_scores.shape}")
 
+        # Attention mask: [batch_size, 1, seq_len, max_seq_len]
         if attention_mask is not None:
-            # [batch_size, 1, 1, seq_len]
-            attention_mask = attention_mask[:, None, None, :]
+            # [batch_size, 1, seq_len, seq_len]
+            print(f"Attention mask: {attention_mask.shape}, key shape: {key.shape}")
+            attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+            print(f"Attention mask after slicing: {attention_mask.shape}")
             # [batch_size, num_heads, seq_len, seq_len]
             attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, seq_len))
         
@@ -519,6 +524,7 @@ class DecoderLayer(nn.Module):
 
         # Attention layer
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
+        print(f"attn_layernorm_out shape: {attn_layernorm_out.shape}")
         attn_outputs = self.attention(
             attn_layernorm_out,
             attention_mask=attention_mask,
@@ -640,14 +646,14 @@ def update_causal_mask(
     batch_size, seq_len = attention_mask.shape
     min_dtype = jnp.finfo(config.dtype).min
     print(f"min_dtype: {min_dtype}, attention_mask shape: {attention_mask.shape}")
-    causal_mask = jnp.full((batch_size, target_length), fill_value=min_dtype, dtype=config.dtype)
+    causal_mask = jnp.full((seq_len, target_length), fill_value=min_dtype, dtype=config.dtype)
     print(f"causal_mask shape: {causal_mask.shape}")
     if seq_len != 1:
         causal_mask = jnp.triu(causal_mask, k=1)
     print(f"cache_position shape: {cache_position.shape}")
-    causal_mask *= jnp.arange(target_length)[None, None, :].repeat(batch_size, axis=0) > cache_position[None, :, None].repeat(batch_size, axis=0)
-    causal_mask = causal_mask[None, None, :, :]
-    causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, target_length))
+    causal_mask *= jnp.arange(target_length) > cache_position[:, None]
+    causal_mask = causal_mask[None, None, :, :].repeat(batch_size, axis=0)
+    #causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, target_length))
     
     if attention_mask is not None:
         mask_length = attention_mask.shape[-1]
@@ -744,12 +750,13 @@ class FalconModel(FalconPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        if (input_ids is None) ^ (input_embeds is None):
+        if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError("You have to specify exactly one of input_ids or input_embeds.")
         
+        print(f"Input ids: {input_ids.shape}")
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
-
+        print(f"input embeds: {input_embeds.shape}")
         past_kv_len = kv_cache["key"].shape[-2] if kv_cache is not None else 0
         if cache_position is None:
             cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
@@ -773,7 +780,7 @@ class FalconModel(FalconPreTrainedModel):
         for i, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            print(f"Block {i} input shape: {hidden_states.shape}")
             # Apply attention block
             outputs = block(
                 hidden_states=hidden_states,

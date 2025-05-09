@@ -2,6 +2,7 @@ import jax
 import inspect
 import jax.numpy as jnp
 from typing import Any, NamedTuple, Optional, Tuple
+from configuration_falcon import FalconConfig
 
 def compare_results(x, y):
     frame = inspect.currentframe().f_back
@@ -32,46 +33,16 @@ class KVCache():
     k_cache: jax.Array
     v_cache: jax.Array
 
-    def __init__(self, config, key: Optional[jax.Array] = None, value: Optional[jax.Array] = None):
+    def __init__(self, config: FalconConfig, batch_size: int, key: Optional[jax.Array] = None, value: Optional[jax.Array] = None):
         """Initialize the KVCache with key and value tensors."""
         # key and value shapes: [batch_size, num_heads, max_seq_len, head_dim]
         if key is None:
-            key = jnp.zeros((config.batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim), dtype=config.dtype)
-        else:
-            assert key.ndim == 4, f"Key should be 4D, but got {key.ndim}D."
-            assert value.ndim == 4, f"Value should be 4D, but got {value.ndim}D."
-            if key.shape != (config.batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim):
-                # Expand key to the correct shape, keeping existing values and padding with zeros if needed
-                pad_shape = (
-                    0, config.batch_size - key.shape[0],
-                    0, config.num_attention_heads - key.shape[1],
-                    0, config.max_position_embeddings - key.shape[2],
-                    0, config.head_dim - key.shape[3],
-                )
-                key = jnp.pad(
-                    key,
-                    ((0, pad_shape[1]), (0, pad_shape[3]), (0, pad_shape[5]), (0, pad_shape[7])),
-                    mode="constant"
-                )
-        self.key = key
+            self.key = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embedding, config.head_dim), dtype=jnp.float32)
         if value is None:
-            value = jnp.zeros((config.batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim), dtype=config.dtype)
-        else:
-            assert value.ndim == 4, f"Value should be 4D, but got {value.ndim}D."
-            if value.shape != (config.batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim):
-                # Expand value to the correct shape, keeping existing values and padding with zeros if needed
-                pad_shape = (
-                    0, config.batch_size - value.shape[0],
-                    0, config.num_attention_heads - value.shape[1],
-                    0, config.max_position_embeddings - value.shape[2],
-                    0, config.head_dim - value.shape[3],
-                )
-                value = jnp.pad(
-                    value,
-                    ((0, pad_shape[1]), (0, pad_shape[3]), (0, pad_shape[5]), (0, pad_shape[7])),
-                    mode="constant"
-                )
-        self.value = value
+            self.value = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embedding, config.head_dim), dtype=jnp.float32)
+        self.k_cache = key
+        self.v_cache = value
+        
 
     def shift_left_kv_cache(self):
         """Shift the key and value cache to the left by one position."""
