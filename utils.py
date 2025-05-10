@@ -27,6 +27,7 @@ f"""Info for second argument:
     Shape: {y.shape}.""")
     print(f"PCC Score: {jnp.min(jnp.corrcoef(x.flatten(), y.flatten()))}")
     print(f"Max Difference: {jnp.max(jnp.abs(x - y))}")
+    print(f"Mean Difference: {jnp.mean(jnp.abs(x - y))}")
     print("=" * 50)
 
 class KVCache():

@@ -257,9 +257,11 @@ class AttentionLayer(nn.Module):
             use_bias=self.config.bias,
             dtype=self.config.dtype
         )
-        self.attention_dropout = nn.Dropout(rate=self.config.attention_dropout, deterministic=False)
+        self.attention_dropout = nn.Dropout(
+            rate=self.config.attention_dropout,
+            deterministic=False
+        )
 
-    
     
     def __call__(
         self,
@@ -278,7 +280,7 @@ class AttentionLayer(nn.Module):
             hidden_states (`jax.Array`):
                 Input tensor of shape [batch_size, seq_len, hidden_size]
             attention_mask (`jax.Array`):
-                Attention mask of shape [batch_size, seq_len]
+                Attention mask of shape [batch_size, 1, seq_len, max_seq_len]
             position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
             use_cache (`bool`):
@@ -342,17 +344,17 @@ class AttentionLayer(nn.Module):
             attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, seq_len))
         
         # Apply attention mask
-        attention_probs = nn.softmax(attention_scores + attention_mask, axis=-1)
+        attention_scores = nn.softmax(attention_scores + attention_mask, axis=-1)
         # Apply dropout if needed
-        attention_probs = self.attention_dropout(attention_probs)
+        attention_scores = self.attention_dropout(attention_scores)
         # Apply head_mask
         if head_mask is not None:
-            attention_probs = attention_probs * head_mask
+            attention_scores = attention_scores * head_mask
 
         # [batch_size, num_heads, seq_len, seq_len] @
         # [batch_size, num_heads, seq_len, head_dim] =
         # [batch_size, num_heads, seq_len, head_dim]
-        attention_output = jnp.matmul(attention_probs, value)
+        attention_output = jnp.matmul(attention_scores, value)
         # [batch_size, seq_len, num_heads, head_dim]
         attention_output = jnp.transpose(attention_output, (0, 2, 1, 3))
         # [batch_size, seq_len, hidden_size]

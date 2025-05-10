@@ -5,10 +5,7 @@ from transformers.models.falcon.modeling_falcon import (
     FalconAttention,
     FalconRotaryEmbedding
 )
-from transformers.models.falcon.configuration_falcon import (
-    FalconConfig, 
-)
-from model import merge_heads, split_heads, AttentionLayer 
+from model import split_heads, AttentionLayer 
 import jax.numpy as jnp
 import torch
 from utils import compare_results
@@ -36,17 +33,17 @@ compare_results(jax_q, jnp.array(torch_q.numpy(), dtype=jnp.float32))
 compare_results(jax_k, jnp.array(torch_k.numpy(), dtype=jnp.float32))
 compare_results(jax_v, jnp.array(torch_v.numpy(), dtype=jnp.float32))
 
+attn_jax = AttentionLayer(config=config)
+attn_torch = FalconAttention(config)
 
 x_np = np.random.randn(batch_size, seq_len, hidden_dim).astype(np.float32)
 x_jax = jnp.array(x_np)
 x_torch = torch.tensor(x_np)
-
-attn_jax = AttentionLayer(config=config)
-attn_torch = FalconAttention(config)
-attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
-attention_mask_torch = torch.ones((batch_size, seq_len), dtype=torch.float32)
+attention_mask = jnp.ones((batch_size, 1, 1, seq_len), dtype=jnp.float32)
+attention_mask_torch = torch.ones((batch_size, 1, 1, seq_len), dtype=torch.float32)
 position_ids = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
 position_ids_torch = torch.Tensor(np.array(position_ids)).to(torch.int32)
+
 variables = attn_jax.init(jax.random.PRNGKey(0), x_jax, attention_mask, position_ids)
 params = variables['params']
 print(f"jax: {params['query_key_value']['kernel'].shape} torch: {attn_torch.query_key_value.weight.shape}")
@@ -58,10 +55,36 @@ params['dense']['kernel'] = jnp.array(attn_torch.dense.weight.detach().numpy())
 
 torch_rope = FalconRotaryEmbedding(config)
 pos_embeddings = torch_rope(x_torch, position_ids_torch)
-attention_mask_torch = attention_mask_torch[:, None, None, :]
-
+# attn_outputs = self.attention(
+#             attn_layernorm_out,
+#             attention_mask=attention_mask,
+#             position_ids=position_ids,
+#             head_mask=head_mask,
+#             use_cache=use_cache,
+#             kv_cache=kv_cache if use_cache else None,
+#             cache_position=cache_position,
+#             output_attentions=output_attentions,
+#             position_embeddings=position_embeddings
+#         )
 # Forward
-out_jax, _, jax_scores = attn_jax.apply({'params': params}, x_jax, attention_mask, position_ids, output_attentions=True)
-out_torch, _, torch_scores = attn_torch(x_torch, alibi=None, attention_mask=attention_mask_torch, position_embeddings=pos_embeddings, output_attentions=True)
+out_jax, _, jax_scores = attn_jax.apply(
+    {'params': params},
+    x_jax,
+    attention_mask=attention_mask,
+    position_ids=position_ids,
+    head_mask=None,
+    use_cache=True,
+    #position_embeddings=pos_embeddings,
+    output_attentions=True
+)
+out_torch, _, torch_scores = attn_torch(
+    x_torch,
+    alibi=None,
+    head_mask=None,
+    attention_mask=attention_mask_torch,
+    position_embeddings=pos_embeddings,
+    use_cache=True,
+    output_attentions=True
+)
 compare_results(out_jax, jnp.array(out_torch.detach().numpy(), dtype=jnp.float32))
 compare_results(jax_scores, jnp.array(torch_scores.detach().numpy(), dtype=jnp.float32))
