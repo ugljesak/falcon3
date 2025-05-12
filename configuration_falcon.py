@@ -43,11 +43,6 @@ class FalconConfig(PretrainedConfig):
 
     def __post_init__(self):
 
-        if self.head_dim * self.num_heads != self.hidden_size:
-            raise ValueError(f"Hidden size {self.hidden_size} must be divisible by number of attention heads {self.num_heads}.")
-        if self.num_heads % self.num_kv_heads != 0:
-            raise ValueError(f"Number of attention heads {self.num_heads} must be divisible by number of kv heads {self.num_kv_heads}.")
-        
         if self.num_kv_heads is None:
             if self.multi_query:
                 self.num_kv_heads = 1
@@ -62,9 +57,13 @@ class FalconConfig(PretrainedConfig):
             if self.num_ln_in_parallel_attn is None:
                 self.num_ln_in_parallel_attn = 2
                 
-        if self.num_ln_in_parallel_attn is None and self.new_decoder_architecture:
-            self.num_ln_in_parallel_attn = 2
-            
+        # Check for valid configurations
+        if self.head_dim * self.num_heads != self.hidden_size:
+            raise ValueError(f"Hidden size {self.hidden_size} must be divisible by number of attention heads {self.num_heads}.")
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError(f"Number of attention heads {self.num_heads} must be divisible by number of kv heads {self.num_kv_heads}.")
+        
+
     @property
     def head_dim(self):
         return self.hidden_size // self.num_attention_heads

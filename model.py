@@ -30,7 +30,7 @@ from configuration_falcon import FalconConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from output_models import *
 from transformers.cache_utils import Cache
-from utils import KVCache 
+from utils import KVCache, fixed_cross_entropy_loss 
 
 class DenseLayer(nn.Module):
     """Linear layer for Falcon model."""
@@ -712,7 +712,7 @@ class FalconModel(FalconPreTrainedModel):
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
         head_mask: Optional[jax.Array] = None,
-        kv_cache: Optional[Dict[str, jax.Array]] = None,
+        kv_cache: Optional[KVCache] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
@@ -827,20 +827,20 @@ class FalconModel(FalconPreTrainedModel):
         
 class FalconForCausalLM(FalconPreTrainedModel):
     """Falcon model for causal language modeling."""
+    config: FalconConfig
 
-    def __init__(self, config: FalconConfig, *args, **kwargs):
-        super.__init__(config, *args, **kwargs)
-        
+    def setup(self):
+    
         # Set up the model
-        self.transformer = FalconModel(config)
+        self.transformer = FalconModel(self.config)
         
         # Set up the lm head
         self.lm_head = DenseLayer(
-            config=config,
-            in_features=config.hidden_size,
-            out_features=config.vocab_size,
+            config=self.config,
+            in_features=self.config.hidden_size,
+            out_features=self.config.vocab_size,
             use_bias=False,
-            dtype=config.dtype
+            dtype=self.config.dtype
         )
 
     def get_output_embeddings(self):
@@ -849,14 +849,16 @@ class FalconForCausalLM(FalconPreTrainedModel):
     def set_output_embeddings(self, new_embeddings: jax.Array):
         self.lm_head = new_embeddings
 
-    def forward(
+    def __call__(
         self,
         input_ids: Optional[jax.Array] = None,
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
+        input_embeds: Optional[jax.Array] = None,
         head_mask: Optional[jax.Array] = None,
-        kv_cache: Optional[Dict[str, jax.Array]] = None,
         use_cache: Optional[bool] = None,
+        kv_cache: Optional[Dict[str, jax.Array]] = None,
+        cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -873,7 +875,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
                 `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
                 are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
             
-            logits_to_keep (`int`, *optional*):
+            logits_to_keep (`int` | `jax.Array`, *optional*):
                 If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
                 `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
                 token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
@@ -881,7 +883,10 @@ class FalconForCausalLM(FalconPreTrainedModel):
                 This is useful when using packed tensor format (single dimension for batch and sequence length).
 
         Returns:
-            Output tensor of shape [batch_size, seq_len, vocab_size]
+            Output logits tensor of shape [batch_size, seq_len, vocab_size]
+            past_key_values (optional): Key-Value cache for past key-value pairs
+            hidden_states (optional): Hidden states throughout model of shape [batch_size, seq_len, hidden_size]
+            attentions (optional): Attention scores throughout model of shape [batch_size, num_heads, seq_len, seq_len]
         """
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -891,9 +896,11 @@ class FalconForCausalLM(FalconPreTrainedModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            input_embeds=input_embeds,
             head_mask=head_mask,
-            kv_cache=kv_cache,
             use_cache=use_cache,
+            kv_cache=kv_cache,
+            cache_position=cache_position,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -901,13 +908,29 @@ class FalconForCausalLM(FalconPreTrainedModel):
 
         hidden_states = transformer_outputs.last_hidden_state
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        lm_logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+            hidden_states = hidden_states[:, -logits_to_keep:, :]
+        elif isinstance(logits_to_keep, jax.Array):
+            # must be 1D array of logits to keep in seq_len (second dim)
+            # [batch_size, seq_len (we chop here), hidden_size]
+            hidden_states = jnp.take(hidden_states, logits_to_keep, axis=1)
+            
+        lm_logits = self.lm_head(hidden_states)
+        
+        loss = None
+        if labels is not None:
+            loss = fixed_cross_entropy_loss(
+                logits=lm_logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                #num_items_in_batch=lm_logits.shape[0],
+            )
 
         if not return_dict:
-            return (lm_logits,) + transformer_outputs[1:]
+            return (loss, lm_logits,) + transformer_outputs[1:]
 
         return CausalLMOutputWithCrossAttentions(
+            loss=loss,
             logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
