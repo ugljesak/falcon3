@@ -36,23 +36,26 @@ position_ids_torch = torch.Tensor(np.array(position_ids_jax)).to(torch.int32)
 falcon_jax = FalconModel(config=config)
 falcon_torch = FalconTorch(config)
 
-# Initialize the JAX model
-# Initialize JAX model parameters
-key = jax.random.PRNGKey(0)
-params_jax = falcon_jax.init(key, input_ids=x_jax, input_embeds=None, attention_mask=attention_mask_jax, position_ids=position_ids_jax)
-
 # Copy weights from torch to jax
 def torch_to_jnp(tensor):
     return jnp.array(tensor.detach().numpy())
 
+# Initialize the JAX model
+# Initialize JAX model parameters
+key = jax.random.PRNGKey(0)
+def init_jax_model(key, x_jax, attention_mask_jax, position_ids_jax, falcon_torch):
+    params_jax = falcon_jax.init(key, input_ids=x_jax, input_embeds=None, attention_mask=attention_mask_jax, position_ids=position_ids_jax)
+    params_jax['params']['word_embeddings']['embedding'] = torch_to_jnp(falcon_torch.word_embeddings.weight)
+    for i in range(config.num_hidden_layers):
+        blocks_i = "blocks_" + str(i)
+        params_jax['params'][blocks_i]['attention']['query_key_value']['kernel'] = torch_to_jnp(falcon_torch.h[i].self_attention.query_key_value.weight)
+        params_jax['params'][blocks_i]['attention']['dense']['kernel'] = torch_to_jnp(falcon_torch.h[i].self_attention.dense.weight)
+        params_jax['params'][blocks_i]['mlp']['dense_h_to_4h']['kernel'] = torch_to_jnp(falcon_torch.h[i].mlp.dense_h_to_4h.weight)
+        params_jax['params'][blocks_i]['mlp']['dense_4h_to_h']['kernel'] = torch_to_jnp(falcon_torch.h[i].mlp.dense_4h_to_h.weight)
+    return params_jax
+
+params_jax = init_jax_model(key, x_jax, attention_mask_jax, position_ids_jax, falcon_torch)
 print(f"jax: {params_jax['params']['word_embeddings']['embedding'].shape} torch: {falcon_torch.word_embeddings.weight.shape}")
-params_jax['params']['word_embeddings']['embedding'] = torch_to_jnp(falcon_torch.word_embeddings.weight)
-for i in range(config.num_hidden_layers):
-    blocks_i = "blocks_" + str(i)
-    params_jax['params'][blocks_i]['attention']['query_key_value']['kernel'] = torch_to_jnp(falcon_torch.h[i].self_attention.query_key_value.weight)
-    params_jax['params'][blocks_i]['attention']['dense']['kernel'] = torch_to_jnp(falcon_torch.h[i].self_attention.dense.weight)
-    params_jax['params'][blocks_i]['mlp']['dense_h_to_4h']['kernel'] = torch_to_jnp(falcon_torch.h[i].mlp.dense_h_to_4h.weight)
-    params_jax['params'][blocks_i]['mlp']['dense_4h_to_h']['kernel'] = torch_to_jnp(falcon_torch.h[i].mlp.dense_4h_to_h.weight)
 
 # jax_embeddings_params = {'params': {'word_embeddings': {'embedding': params_jax['params']['word_embeddings']['embedding']}}}
 # @jax.jit
@@ -64,15 +67,21 @@ for i in range(config.num_hidden_layers):
 # compare_results(jax_embeddings, jnp.array(torch_embeddings.detach().numpy(), dtype=jnp.float32))
 
 # Apply the parameters to the JAX model
-out_jax = falcon_jax.apply(
-    params_jax,
-    x_jax,
-    attention_mask=attention_mask_jax,
-    position_ids=position_ids_jax,
-    output_attentions=True,
-    output_hidden_states=True,
-    use_cache=True
-)
+
+@jax.jit
+def jax_apply(x_jax, params_jax, attention_mask_jax, position_ids_jax):
+    out = falcon_jax.apply(
+        params_jax,
+        x_jax,
+        attention_mask=attention_mask_jax,
+        position_ids=position_ids_jax,
+        output_attentions=True,
+        output_hidden_states=True,
+        use_cache=True
+    )
+    return out.last_hidden_state, out.past_key_values, out.attentions
+
+out_jax = jax_apply(x_jax, params_jax, attention_mask_jax, position_ids_jax)
 out_torch = falcon_torch(
     x_torch,
     attention_mask=attention_mask_torch,
@@ -87,5 +96,5 @@ out_torch = falcon_torch(
 #                 hidden_states=all_hidden_states,
 #                 attentions=all_self_attentions
 #             )
-print(f"jax: {len(out_jax.attentions)} torch: {len(out_torch.attentions)}")
-compare_results(out_jax.last_hidden_state, jnp.array(out_torch.last_hidden_state.detach().numpy()))
+print(f"jax: {len(out_jax[2])} torch: {len(out_torch.attentions)}")
+compare_results(out_jax[0], jnp.array(out_torch.last_hidden_state.detach().numpy()))

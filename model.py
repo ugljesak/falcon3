@@ -185,20 +185,28 @@ def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, 
             Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
     """
     batch_size, seq_len, _ = fused_qkv.shape
+    # `num_kv_heads` kv's shared by `num_heads` heads
+    # `num_kv_heads` must be divisible by `num_heads`
     if config.group_query:
+        # We split the last dimension into (num_kv_heads, num_heads/num_kv_heads + 2, head_dim)
+        # [batch_size, seq_len, num_kv_heads, num_heads/num_kv_heads + 2, head_dim]
         qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, -1, config.num_heads // config.num_kv_heads + 2, config.head_dim))
+        # [batch_size, seq_len, num_kv_heads, num_heads/num_kv_heads, head_dim]
         query = qkv[..., :-2, :]
+        # [batch_size, seq_len, num_kv_heads, 1, head_dim]
         key = qkv[..., [-2], :]
+        # [batch_size, seq_len, num_kv_heads, 1, head_dim]
         value = qkv[..., [-1], :]
-        print(f"query shape: {query.shape}, key shape: {key.shape}")
         key = jnp.broadcast_to(key, query.shape)
         value = jnp.broadcast_to(value, query.shape)
-        query, key, value = [jnp.reshape(x,(batch_size, seq_len, -1, config.head_dim)) for x in (query, key, value)]
-        print(f"query shape: {query.shape}, key shape: {key.shape}")
+        # qkv shape: [batch_size, seq_len, num_heads, head_dim]
+        query, key, value = [jnp.reshape(x, (batch_size, seq_len, -1, config.head_dim)) for x in (query, key, value)]
         return query, key, value
+    # 1 kv shared across all heads
     elif config.multi_query:
         qkv = jnp.reshape(batch_size, seq_len, config.num_heads + 2, config.head_dim)
         return qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
+    # every had has its own kv
     else:
         qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_heads, 3, config.head_dim))
         return qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
@@ -223,9 +231,7 @@ class AttentionLayer(nn.Module):
             self.num_kv_heads = self.num_heads
         if layer_idx is not None:
             self.layer_idx = layer_idx
-        else:
-            print("Layer index not provided, could indicate to bugs in the forward pass because caching is used.")
-        
+       
         # Layer-wise attention scaling
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         
@@ -302,7 +308,7 @@ class AttentionLayer(nn.Module):
                 Optional key-value cache for past key-value pairs
                 Optional attention scores of shape [batch_size, num_heads, seq_len, seq_len]
         """
-        print(f"AttentionLayer: hidden_states shape: {hidden_states.shape}, attention_mask shape: {attention_mask.shape}, position_ids shape: {position_ids.shape}")
+        
         # [batch_size, seq_len, qkv_out_dim]
         fused_qkv = self.query_key_value(hidden_states)
         (query, key, value) = split_heads(fused_qkv, self.config)
@@ -313,7 +319,6 @@ class AttentionLayer(nn.Module):
         query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
         key = jnp.reshape(key, (batch_size, self.num_heads, seq_len, self.head_dim))
         value = jnp.reshape(value, (batch_size, self.num_heads, seq_len, self.head_dim))
-
         if position_embeddings is None:
             cos, sin = self.rope(hidden_states, position_ids)
         else:
@@ -337,9 +342,7 @@ class AttentionLayer(nn.Module):
         # Attention mask: [batch_size, 1, seq_len, max_seq_len]
         if attention_mask is not None:
             # [batch_size, 1, seq_len, seq_len]
-            print(f"Attention mask: {attention_mask.shape}, key shape: {key.shape}")
             attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-            print(f"Attention mask after slicing: {attention_mask.shape}")
             # [batch_size, num_heads, seq_len, seq_len]
             attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, seq_len))
         
@@ -349,6 +352,8 @@ class AttentionLayer(nn.Module):
         attention_scores = self.attention_dropout(attention_scores)
         # Apply head_mask
         if head_mask is not None:
+            # [1, num_heads, 1, 1] -> [batch_size, num_heads, seq_len, seq_len]
+            # Directly broadcasted to attention scores in response to the multiplying operation
             attention_scores = attention_scores * head_mask
 
         # [batch_size, num_heads, seq_len, seq_len] @
@@ -495,14 +500,14 @@ class DecoderLayer(nn.Module):
             hidden_states (`jax.Array`):
                 Input tensor of shape [batch_size, seq_len, hidden_size]
             attention_mask (`jax.Array`):
-                Attention mask of shape [batch_size, seq_len]
+                Attention mask of shape [batch_size, 1, seq_len, max_seq_len]
             position_ids (`jax.Array`):
                 Position IDs of shape [batch_size, seq_len]
             head_mask (`jax.Array`, *optional*):
-                Mask for attention heads of size [batch_size, num_heads, seq_len, seq_len]
+                Mask for attention heads of size [1, num_heads, 1, 1]
             use_cache (`bool`):
                 Whether to use cache for key-value pairs.
-            kv_cache (`Dict[str, jax.Array]`, *optional*):
+            kv_cache (`KVCache`, *optional*):
                 Key-Value cache for past key-value pairs
             cache_position (`jax.Array`, *optional*):
                 Position IDs for cache
@@ -526,7 +531,6 @@ class DecoderLayer(nn.Module):
 
         # Attention layer
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
-        print(f"attn_layernorm_out shape: {attn_layernorm_out.shape}")
         attn_outputs = self.attention(
             attn_layernorm_out,
             attention_mask=attention_mask,
@@ -625,20 +629,20 @@ def update_causal_mask(
     config: FalconConfig,
     attention_mask: jax.Array,
     cache_position: jax.Array,
-):
+) -> jax.Array:
     """
     Update the causal mask for the model.
 
     Args:
         attention_mask (`jax.Array`):
-            Attention mask of shape [batch_size, seq_len] or [batch_size, 1, query_lenght, kv_length]
+            Attention mask of shape [seq_len, max_seq_len] or [batch_size, 1, seq_len, kv_length]
         cache_position (`jax.Array`):
             Position IDs for cache
         past_key_values (`KVCache`):
             Key-Value cache for past key-value pairs
 
     Returns:
-        Updated attention mask of shape [batch_size, 1, 1, seq_len]
+        Updated attention mask of shape [batch_size, 1, seq_len, seq_len]
     """
     if attention_mask is not None and attention_mask.ndim == 4:
         return attention_mask
@@ -718,7 +722,7 @@ class FalconModel(FalconPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> Union[BaseModelOutputWithPastAndCrossAttentions, Tuple[jax.Array, ...]]:
         """
         Args:
             input_ids (`jax.Array`):
@@ -731,7 +735,7 @@ class FalconModel(FalconPreTrainedModel):
                 Position IDs of shape [batch_size, seq_len]
             head_mask (`jax.Array`):
                 Mask for attention heads of shape [num_heads] or [num_layers, num_heads]
-            kv_cache (`Dict[str, jax.Array]`, *optional*):
+            kv_cache (`KVCache`, *optional*):
                 Key-Value cache for past key-value pairs
             use_cache (`bool`):
                 Whether to use cache for key-value pairs.
@@ -742,7 +746,7 @@ class FalconModel(FalconPreTrainedModel):
             output_hidden_states (`bool`):
                 Whether to output hidden states.
             return_dict (`bool`):
-                Whether to return a dictionary or a tuple.
+                Whether to return a dictionary(Output object) or a tuple.
         Returns:
             Output tensor of shape [batch_size, seq_len, hidden_size]
         """
@@ -755,10 +759,8 @@ class FalconModel(FalconPreTrainedModel):
         if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError("You have to specify exactly one of input_ids or input_embeds.")
         
-        print(f"Input ids: {input_ids.shape}")
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
-        print(f"input embeds: {input_embeds.shape}")
         past_kv_len = kv_cache["key"].shape[-2] if kv_cache is not None else 0
         if cache_position is None:
             cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
@@ -782,7 +784,7 @@ class FalconModel(FalconPreTrainedModel):
         for i, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            print(f"Block {i} input shape: {hidden_states.shape}")
+            print(f"Passing block {i}.")
             # Apply attention block
             outputs = block(
                 hidden_states=hidden_states,

@@ -15,6 +15,9 @@ from output_models import *
 config = FalconConfig(
     group_query=True,
     num_hidden_layers=2,
+    num_kv_heads=6,
+    num_attention_heads=30,
+    hidden_size=480,
     num_ln_in_parallel_attn=2,
     parallel_attn=True,
 )
