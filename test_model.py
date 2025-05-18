@@ -14,7 +14,10 @@ from output_models import *
 
 config = FalconConfig(
     group_query=True,
-    num_hidden_layers=4,
+    num_kv_heads=6,
+    num_attention_heads=30,
+    hidden_size=480,
+    num_hidden_layers=2,
     num_ln_in_parallel_attn=2,
     parallel_attn=True,
 )
@@ -68,7 +71,7 @@ print(f"jax: {params_jax['params']['word_embeddings']['embedding'].shape} torch:
 
 # Apply the parameters to the JAX model
 
-@jax.jit
+#@jax.jit
 def jax_apply(x_jax, params_jax, attention_mask_jax, position_ids_jax):
     out = falcon_jax.apply(
         params_jax,

@@ -39,9 +39,9 @@ class KVCache():
         """Initialize the KVCache with key and value tensors."""
         # key and value shapes: [batch_size, num_heads, max_seq_len, head_dim]
         if key is None:
-            self.key = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embedding, config.head_dim), dtype=jnp.float32)
+            self.key = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim), dtype=jnp.float32)
         if value is None:
-            self.value = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embedding, config.head_dim), dtype=jnp.float32)
+            self.value = jnp.zeros((batch_size, config.num_attention_heads, config.max_position_embeddings, config.head_dim), dtype=jnp.float32)
         self.k_cache = key
         self.v_cache = value
         

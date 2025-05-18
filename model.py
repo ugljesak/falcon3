@@ -275,7 +275,7 @@ class AttentionLayer(nn.Module):
         attention_mask: jax.Array,
         position_ids: jax.Array,
         use_cache: bool = True,
-        kv_cache: Optional[KVCache] = None,
+        kv_cache: Optional[Union[KVCache, Tuple[jax.Array, jax.Array]]] = None,
         head_mask: Optional[jax.Array] = None,
         cache_position: Optional[jax.Array] = None,
         position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
@@ -328,9 +328,19 @@ class AttentionLayer(nn.Module):
         # Use cached key and value if available
         if use_cache:
             if kv_cache is None:
-                kv_cache = KVCache(self.config, batch_size, key, value)
+                # Using custom cache class
+                # kv_cache = KVCache(self.config, batch_size, key, value)
+                k_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=self.config.dtype)
+                v_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=self.config.dtype)
+                kv_cache = k_cached, v_cached
             else:
-                key, value = kv_cache.update(key, value, cache_position, cos, sin)
+                # Using custom cache class
+                # key, value = kv_cache.update(key, value, cache_position, cos, sin)
+                k_cached, v_cached = kv_cache
+                k_cached = self.key.at[:, :, cache_position, :].set(key)
+                v_cached = self.value.at[:, :, cache_position, :].set(value)
+                key, value = k_cached, v_cached
+                kv_cache = key, value
         
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -490,7 +500,7 @@ class DecoderLayer(nn.Module):
         position_ids: jax.Array,
         head_mask: Optional[jax.Array] = None,
         use_cache: bool = False,
-        kv_cache: Optional[KVCache] = None,
+        kv_cache: Optional[Union[KVCache, Tuple[jax.Array, jax.Array]]] = None,
         cache_position: Optional[jax.Array] = None,
         output_attentions: bool = False,
         position_embeddings: Optional[Tuple[jax.Array, jax.Array]] = None,
@@ -716,7 +726,7 @@ class FalconModel(FalconPreTrainedModel):
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
         head_mask: Optional[jax.Array] = None,
-        kv_cache: Optional[KVCache] = None,
+        kv_cache: Optional[Union[KVCache, Tuple[jax.Array, jax.Array]]] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
@@ -859,7 +869,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
         input_embeds: Optional[jax.Array] = None,
         head_mask: Optional[jax.Array] = None,
         use_cache: Optional[bool] = None,
-        kv_cache: Optional[Dict[str, jax.Array]] = None,
+        kv_cache: Optional[Union[KVCache, Tuple[jax.Array, jax.Array]]] = None,
         cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
