@@ -4,11 +4,11 @@ from transformers.models.falcon.modeling_falcon import (
     FalconMLP,
     FalconAttention,
 )
-from model import merge_heads, split_heads, MLPBlock 
+from falcon3.model.model_falcon import merge_heads, split_heads, MLPBlock 
 import jax.numpy as jnp
 import torch
-from utils import compare_results
-from configuration_falcon import FalconConfig
+from falcon3.test_layers.test_utils import compare_results
+from falcon3.model.configuration_falcon import FalconConfig
 
 config = FalconConfig(group_query=True, num_kv_heads=1, num_attention_heads=30, hidden_size=480)
 

@@ -8,10 +8,10 @@ from transformers.models.falcon.modeling_falcon import (
 from transformers.models.falcon.configuration_falcon import (
     FalconConfig, 
 )
-from model import DenseLayer
+from model.model_falcon import DenseLayer
 import jax.numpy as jnp
 import torch
-from utils import compare_results
+from test_layers.test_utils import compare_results
 
 batch_size = 8
 input_dim = 128

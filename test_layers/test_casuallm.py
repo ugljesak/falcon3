@@ -5,12 +5,12 @@ from transformers.models.falcon.modeling_falcon import (
     FalconDecoderLayer,
     FalconForCausalLM as FalconForCasualLMTorch
 )
-from model import FalconForCausalLM
+from falcon3.model.model_falcon import FalconForCausalLM
 import jax.numpy as jnp
 import torch
-from utils import compare_results
-from configuration_falcon import FalconConfig
-from output_models import *
+from falcon3.test_layers.test_utils import compare_results
+from falcon3.model.configuration_falcon import FalconConfig
+from falcon3.model.output_models import *
 
 config = FalconConfig(
     group_query=True,

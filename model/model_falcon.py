@@ -26,11 +26,11 @@ from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 # from jax.experimental.mesh_utils import Mesh
 from jax.sharding import Mesh as ShardingMesh
 from jax.sharding import PartitionSpec as P
-from configuration_falcon import FalconConfig
+from falcon3.model.configuration_falcon import FalconConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from output_models import *
 from transformers.cache_utils import Cache
-from utils import KVCache, fixed_cross_entropy_loss 
+from ..test_layers.test_utils import KVCache, fixed_cross_entropy_loss 
 
 class DenseLayer(nn.Module):
     """Linear layer for Falcon model."""

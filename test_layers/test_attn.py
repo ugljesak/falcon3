@@ -5,11 +5,11 @@ from transformers.models.falcon.modeling_falcon import (
     FalconAttention,
     FalconRotaryEmbedding
 )
-from model import split_heads, AttentionLayer 
+from falcon3.model.model_falcon import split_heads, AttentionLayer 
 import jax.numpy as jnp
 import torch
-from utils import compare_results
-from configuration_falcon import FalconConfig
+from falcon3.test_layers.test_utils import compare_results
+from falcon3.model.configuration_falcon import FalconConfig
 
 config = FalconConfig(group_query=True, num_kv_heads=1, num_attention_heads=30, hidden_size=480)
 batch_size = 8
