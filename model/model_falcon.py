@@ -21,16 +21,17 @@ from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 import numpy as np
+import optax
 
 from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 # from jax.experimental.mesh_utils import Mesh
 from jax.sharding import Mesh as ShardingMesh
 from jax.sharding import PartitionSpec as P
-from falcon3.model.configuration_falcon import FalconConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-from output_models import *
 from transformers.cache_utils import Cache
-from ..test_layers.test_utils import KVCache, fixed_cross_entropy_loss 
+from transformers.models.falcon.configuration_falcon import FalconConfig
+from model.output_models import *
+from test.test_utils import KVCache 
 
 class DenseLayer(nn.Module):
     """Linear layer for Falcon model."""
@@ -110,7 +111,7 @@ class RotaryPositionEmbedding(nn.Module):
     def setup(self):
         self.max_seq_len_cached = self.config.max_position_embeddings
         self.attention_scaling = 1.0  # Default scaling
-        self.dtype = self.config.dtype
+        self.dtype = getattr(self.config, "dtype", jnp.float32)
         # setup inv_freq for rotary embeddings
         partial_rotary_factor = self.config.partial_rotary_factor if hasattr(self.config, "partial_rotary_factor") else 1.0
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
@@ -190,7 +191,7 @@ def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, 
     if config.group_query:
         # We split the last dimension into (num_kv_heads, num_heads/num_kv_heads + 2, head_dim)
         # [batch_size, seq_len, num_kv_heads, num_heads/num_kv_heads + 2, head_dim]
-        qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, -1, config.num_heads // config.num_kv_heads + 2, config.head_dim))
+        qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, -1, config.num_attention_heads // config.num_kv_heads + 2, config.head_dim))
         # [batch_size, seq_len, num_kv_heads, num_heads/num_kv_heads, head_dim]
         query = qkv[..., :-2, :]
         # [batch_size, seq_len, num_kv_heads, 1, head_dim]
@@ -204,11 +205,11 @@ def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, 
         return query, key, value
     # 1 kv shared across all heads
     elif config.multi_query:
-        qkv = jnp.reshape(batch_size, seq_len, config.num_heads + 2, config.head_dim)
+        qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_attention_heads + 2, config.head_dim))
         return qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
     # every had has its own kv
     else:
-        qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_heads, 3, config.head_dim))
+        qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, config.num_attention_heads, 3, config.head_dim))
         return qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
 
 class AttentionLayer(nn.Module):
@@ -252,7 +253,7 @@ class AttentionLayer(nn.Module):
             in_features=self.hidden_size,
             out_features=qkv_out_dim,
             use_bias=self.config.bias,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
         # Create output projection
         # [..., hidden_size] -> [..., hidden_size]
@@ -261,7 +262,7 @@ class AttentionLayer(nn.Module):
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             use_bias=self.config.bias,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
         self.attention_dropout = nn.Dropout(
             rate=self.config.attention_dropout,
@@ -314,6 +315,24 @@ class AttentionLayer(nn.Module):
         (query, key, value) = split_heads(fused_qkv, self.config)
         # [batch_size, seq_len, num_heads, head_dim]
         batch_size, seq_len, _, _ = query.shape
+
+        print(f"cache_position {cache_position}, use_cache {use_cache}")
+        print(f"query shape {query.shape} key shape {key.shape}, value shape {value.shape}")
+        # Use cached key and value if available
+        if use_cache:
+            if kv_cache is None:
+                # Using custom cache class
+                # kv_cache = KVCache(self.config, batch_size, key, value)
+                k_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
+                v_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
+                kv_cache = k_cached, v_cached
+            # Using custom cache class
+            # key, value = kv_cache.update(key, value, cache_position, cos, sin)
+            k_cached, v_cached = kv_cache
+            k_cached = k_cached.at[:, :, cache_position, :].set(key)
+            v_cached = v_cached.at[:, :, cache_position, :].set(value)
+            key, value = k_cached, v_cached
+            kv_cache = key, value
         # [batch_size, num_heads, seq_len, head_dim]
         (query, key, value) = [jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value)]
         query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
@@ -324,23 +343,6 @@ class AttentionLayer(nn.Module):
         else:
             cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
-        
-        # Use cached key and value if available
-        if use_cache:
-            if kv_cache is None:
-                # Using custom cache class
-                # kv_cache = KVCache(self.config, batch_size, key, value)
-                k_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=self.config.dtype)
-                v_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=self.config.dtype)
-                kv_cache = k_cached, v_cached
-            else:
-                # Using custom cache class
-                # key, value = kv_cache.update(key, value, cache_position, cos, sin)
-                k_cached, v_cached = kv_cache
-                k_cached = self.key.at[:, :, cache_position, :].set(key)
-                v_cached = self.value.at[:, :, cache_position, :].set(value)
-                key, value = k_cached, v_cached
-                kv_cache = key, value
         
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -404,7 +406,7 @@ class MLPBlock(nn.Module):
             in_features=self.hidden_size,
             out_features=self.ffn_hidden_size,
             use_bias=self.config.bias,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
         
         # Second dense layer
@@ -414,7 +416,7 @@ class MLPBlock(nn.Module):
             in_features=self.ffn_hidden_size,
             out_features=self.hidden_size,
             use_bias=self.config.bias,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
 
         # Dropout layer if needed
@@ -459,11 +461,11 @@ class DecoderLayer(nn.Module):
             self.config.num_ln_in_parallel_attn = 1
             self.input_layernorm = nn.LayerNorm(
                 self.config.layer_norm_epsilon,
-                dtype=self.config.dtype
+                dtype=getattr(self.config, "dtype", jnp.float32)
             )
             self.post_attn_layernorm = nn.LayerNorm(
                 self.config.layer_norm_epsilon,
-                dtype=self.config.dtype
+                dtype=getattr(self.config, "dtype", jnp.float32)
             )
         # Layer normalization if using parallel attention
         else:
@@ -477,7 +479,7 @@ class DecoderLayer(nn.Module):
             if self.config.num_ln_in_parallel_attn == 1:
                 self.input_layernorm = nn.LayerNorm(
                     self.config.layer_norm_epsilon,
-                    dtype=self.config.dtype
+                    dtype=getattr(self.config, "dtype", jnp.float32)
                 )
             #         /-> layernorm -> attention -\
             # input -<                             >-> output
@@ -485,11 +487,11 @@ class DecoderLayer(nn.Module):
             else:
                 self.attn_layernorm = nn.LayerNorm(
                     self.config.layer_norm_epsilon,
-                    dtype=self.config.dtype
+                    dtype=getattr(self.config, "dtype", jnp.float32)
                 )
                 self.mlp_layernorm = nn.LayerNorm(
                     self.config.layer_norm_epsilon,
-                    dtype=self.config.dtype
+                    dtype=getattr(self.config, "dtype", jnp.float32)
                 )
 
     @nn.compact
@@ -660,9 +662,9 @@ def update_causal_mask(
     # Attention mask: [batch_size, seq_len]
     target_length = config.max_position_embeddings
     batch_size, seq_len = attention_mask.shape
-    min_dtype = jnp.finfo(config.dtype).min
+    min_dtype = jnp.finfo(getattr(config, "dtype", jnp.float32)).min
     print(f"min_dtype: {min_dtype}, attention_mask shape: {attention_mask.shape}")
-    causal_mask = jnp.full((seq_len, target_length), fill_value=min_dtype, dtype=config.dtype)
+    causal_mask = jnp.full((seq_len, target_length), fill_value=min_dtype, dtype=getattr(config, "dtype", jnp.float32))
     print(f"causal_mask shape: {causal_mask.shape}")
     if seq_len != 1:
         causal_mask = jnp.triu(causal_mask, k=1)
@@ -698,7 +700,7 @@ class FalconModel(FalconPreTrainedModel):
             num_embeddings=self.config.vocab_size,
             features=self.embed_dim,
             embedding_init=nn.initializers.xavier_uniform(),
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
 
         # Set up the transformer blocks
@@ -707,7 +709,7 @@ class FalconModel(FalconPreTrainedModel):
         # Set up final layer normalization
         self.final_layer_norm = nn.LayerNorm(
             epsilon=self.config.layer_norm_epsilon,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
 
         self.rotary_emb = RotaryPositionEmbedding(config=self.config)
@@ -837,6 +839,41 @@ class FalconModel(FalconPreTrainedModel):
                 attentions=all_self_attentions
             )
         
+def fixed_cross_entropy_loss(
+    logits: jax.Array,
+    labels: jax.Array,
+    vocab_size: int,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+    shift_labels: Optional[jax.Array] = None,
+) -> jax.Array:
+    """Compute the cross-entropy loss with fixed logits."""
+
+    if shift_labels is None:
+        # Shift so that tokens < n predict n
+        pad = jnp.full(labels.shape[:-1] + (1,), ignore_index, dtype=labels.dtype)
+        labels = jnp.concatenate([labels, pad], axis=-1)
+        shift_labels = labels[..., 1:]
+
+    # Flatten the tokens
+    logits = logits.reshape(-1, vocab_size)
+    shift_labels = shift_labels.reshape(-1)
+
+    mask = (shift_labels != ignore_index)
+    masked_labels = jnp.where(mask, shift_labels, 0)
+
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, masked_labels, axis=-1)
+    loss *= mask # Apply mask to loss
+    
+    if num_items_in_batch is not None:
+        # If num_items_in_batch is provided, use it for normalization
+        loss = loss.sum() / num_items_in_batch
+    else:
+        # Otherwise, use the sum of the mask for normalization
+        loss = loss.sum() / jnp.maximum(mask.sum(), 1)
+
+    return loss
+        
 class FalconForCausalLM(FalconPreTrainedModel):
     """Falcon model for causal language modeling."""
     config: FalconConfig
@@ -852,7 +889,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
             in_features=self.config.hidden_size,
             out_features=self.config.vocab_size,
             use_bias=False,
-            dtype=self.config.dtype
+            dtype=getattr(self.config, "dtype", jnp.float32)
         )
 
     def get_output_embeddings(self):
@@ -901,6 +938,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
             attentions (optional): Attention scores throughout model of shape [batch_size, num_heads, seq_len, seq_len]
         """
         
+        return_dict = True if return_dict is None else return_dict
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Call the transformer model
@@ -948,3 +986,76 @@ class FalconForCausalLM(FalconPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def generate(
+        self,
+        input_ids,
+        attention_mask=None,
+        max_new_tokens=20,
+        pad_token_id=None,
+        eos_token_id=None,
+        position_ids = None,
+    ):
+        """Generate text efficiently using properly initialized KV caching in NNX."""
+        # Set defaults for special tokens
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else getattr(self.config, "eos_token_id", None)
+        
+        # Initialize generation variables
+        batch_size, seq_length = input_ids.shape
+        max_length = seq_length + max_new_tokens
+        has_reached_eos = jnp.zeros(batch_size, dtype=jnp.bool_)
+        
+        
+        position_ids = jnp.cumsum(attention_mask, axis=-1) - 1 if position_ids is None else position_ids
+        # Now process the real prompt to fill in the cache for actual tokens
+        outputs = self(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+        # Get next token prediction
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token = jnp.argmax(next_token_logits, axis=-1)
+        next_token = next_token[:, None]  # Add sequence dimension
+        
+        # # Add first generated token
+        all_token_ids = jnp.concatenate([input_ids, next_token], axis=1)
+        
+        # Track current sequence length
+        
+        # Check early stopping conditions
+        if eos_token_id is not None:
+            has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
+
+        cur_len = seq_length
+        # Start auto-regressive generation loop
+        for i in range(1, max_new_tokens):
+            # Early exit if all sequences have reached EOS
+            print(i) #just to track tokens
+            if eos_token_id is not None and jnp.all(has_reached_eos):
+                break
+            
+            # Generate next token using cache
+            new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
+            outputs = self(
+                input_ids=next_token,  # Only process the new token
+                attention_mask=attention_mask,
+                init_cache=True,
+                position_ids = new_position_ids
+            )
+            cur_len += 1
+            # Get logits and predict next token
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = jnp.argmax(next_token_logits, axis=-1)
+            next_token = next_token[:, None]  # Add sequence dimension
+            # Add new token to results
+            all_token_ids = jnp.concatenate([all_token_ids, next_token], axis=1)
+            
+            # Update EOS tracking
+            if eos_token_id is not None:
+                has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
+        
+        return all_token_ids

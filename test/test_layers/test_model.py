@@ -5,21 +5,23 @@ from transformers.models.falcon.modeling_falcon import (
     FalconDecoderLayer,
     FalconModel as FalconTorch
 )
-from falcon3.model.model_falcon import MLPBlock, AttentionLayer, DecoderLayer, FalconModel
+from model.model_falcon import MLPBlock, AttentionLayer, DecoderLayer, FalconModel
 import jax.numpy as jnp
 import torch
-from falcon3.test_layers.test_utils import compare_results
-from falcon3.model.configuration_falcon import FalconConfig
-from falcon3.model.output_models import *
+from ..test_utils import compare_results
+from transformers.models.falcon.configuration_falcon import FalconConfig
+from model.output_models import *
 
 config = FalconConfig(
-    group_query=True,
-    num_kv_heads=6,
+    group_query=False,
+    dtype=jnp.float32,
+    #num_kv_heads=6,
     num_attention_heads=30,
     hidden_size=480,
     num_hidden_layers=2,
     num_ln_in_parallel_attn=2,
     parallel_attn=True,
+    use_cache=True,
 )
 
 batch_size = 8

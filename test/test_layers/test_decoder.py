@@ -4,11 +4,11 @@ from transformers.models.falcon.modeling_falcon import (
     FalconRotaryEmbedding,
     FalconDecoderLayer,
 )
-from falcon3.model.model_falcon import MLPBlock, AttentionLayer, DecoderLayer
+from model.model_falcon import MLPBlock, AttentionLayer, DecoderLayer
 import jax.numpy as jnp
 import torch
-from falcon3.test_layers.test_utils import compare_results
-from falcon3.model.configuration_falcon import FalconConfig
+from .test_utils import compare_results
+from model.configuration_falcon import FalconConfig
 
 config = FalconConfig(group_query=True, num_kv_heads=1, num_attention_heads=30, hidden_size=480)
 

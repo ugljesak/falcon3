@@ -3,7 +3,7 @@ import inspect
 import jax.numpy as jnp
 import optax
 from typing import Any, NamedTuple, Optional, Tuple
-from configuration_falcon import FalconConfig
+from model.configuration_falcon import FalconConfig
 
 def compare_results(x, y):
     frame = inspect.currentframe().f_back
@@ -31,7 +31,7 @@ f"""Info for second argument:
     print(f"Mean Difference: {jnp.mean(jnp.abs(x - y))}")
     print("=" * 50)
 
-class KVCache():
+class KVCache:
     k_cache: jax.Array
     v_cache: jax.Array
 
@@ -58,38 +58,3 @@ class KVCache():
         value = self.value.at[:, :, cache_position, :].set(new_value)
         return key, value
     
-
-def fixed_cross_entropy_loss(
-    logits: jax.Array,
-    labels: jax.Array,
-    vocab_size: int,
-    num_items_in_batch: Optional[int] = None,
-    ignore_index: int = -100,
-    shift_labels: Optional[jax.Array] = None,
-) -> jax.Array:
-    """Compute the cross-entropy loss with fixed logits."""
-
-    if shift_labels is None:
-        # Shift so that tokens < n predict n
-        pad = jnp.full(labels.shape[:-1] + (1,), ignore_index, dtype=labels.dtype)
-        labels = jnp.concatenate([labels, pad], axis=-1)
-        shift_labels = labels[..., 1:]
-
-    # Flatten the tokens
-    logits = logits.reshape(-1, vocab_size)
-    shift_labels = shift_labels.reshape(-1)
-
-    mask = (shift_labels != ignore_index)
-    masked_labels = jnp.where(mask, shift_labels, 0)
-
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, masked_labels, axis=-1)
-    loss *= mask # Apply mask to loss
-    
-    if num_items_in_batch is not None:
-        # If num_items_in_batch is provided, use it for normalization
-        loss = loss.sum() / num_items_in_batch
-    else:
-        # Otherwise, use the sum of the mask for normalization
-        loss = loss.sum() / jnp.maximum(mask.sum(), 1)
-
-    return loss

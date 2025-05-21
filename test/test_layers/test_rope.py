@@ -11,11 +11,11 @@ from transformers.models.falcon.modeling_falcon import (
 from transformers.models.falcon.configuration_falcon import (
     FalconConfig, 
 )
-from falcon3.model.model_falcon import RotaryPositionEmbedding, apply_rotary_pos_emb, rotate_by_quarter
+from model.model_falcon import RotaryPositionEmbedding, apply_rotary_pos_emb, rotate_by_quarter
 import jax.numpy as jnp
 import torch
-from falcon3.test_layers.test_utils import compare_results
-from falcon3.model.configuration_falcon import FalconConfig
+from .test_utils import compare_results
+from model.configuration_falcon import FalconConfig
 
 batch_size = 8
 input_dim = 128

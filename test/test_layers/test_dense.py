@@ -11,16 +11,16 @@ from transformers.models.falcon.configuration_falcon import (
 from model.model_falcon import DenseLayer
 import jax.numpy as jnp
 import torch
-from test_layers.test_utils import compare_results
+from .test_utils import compare_results
 
 batch_size = 8
 input_dim = 128
 output_dim = 128
 # Function to create a simple JAX dense layer
-
+config = FalconConfig(group_query=True)
 
 torch_linears = [FalconLinear(input_dim, output_dim) for i in range(5)]
-jax_dense_layers = [DenseLayer(input_dim, output_dim, use_bias=False) for i in range(5)]
+jax_dense_layers = [DenseLayer(config, input_dim, output_dim, use_bias=False) for i in range(5)]
 jax_x = jnp.array(np.random.normal(size=(batch_size, input_dim)), dtype=jnp.float32)
 torch_x = torch.tensor(np.array(jax_x), dtype=torch.float32)
 for torch_linear in torch_linears:
