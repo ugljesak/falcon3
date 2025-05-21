@@ -23,14 +23,23 @@ def main(
         token_str = tokenizer.special_tokens_map[token_name]
         token_id = tokenizer.convert_tokens_to_ids(token_str)
         print(f"{token_name}: {token_str} -> {token_id}")
-    print(tokenizer.eos_token, tokenizer.pad_token)
-    print(tokenizer.special_tokens_map)
 
     torch_config = AutoConfig.from_pretrained(model_name)
+    torch_config.use_cache = True
+    torch_config.num_hidden_layers = 2
+    torch_config.layer_norm_epsilon = 1e-5
+    torch_config.hidden_dropout = 0.0
+    torch_config.parallel_attn = True
+    torch_config.num_ln_in_parallel_attn = 2
+    torch_config.new_decoder_architecture = False
+    torch_config.multi_query = True
+    torch_config.group_query = False
+    torch_config.use_cache = True
+    torch_config.bias = False
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=torch_config,
-        device_map="auto",
+        device_map="cpu",
         torch_dtype=torch.float32,
     )
 
@@ -41,8 +50,8 @@ def main(
     input_ids = inputs.input_ids.to(torch_model.device)
     attention_mask = inputs.attention_mask.to(torch_model.device)
     print("eos_token_id in input_ids:", tokenizer.eos_token_id in input_ids[0])
-    input_ids = torch.randint(torch_config.vocab_size, (8, 10)).long()
-    attention_mask = torch.ones_like(input_ids)
+    #input_ids = torch.randint(torch_config.vocab_size, (8, 10)).long()
+    #attention_mask = torch.ones_like(input_ids)
     print("✍️ Generating...")
     outputs = torch_model.generate(
         input_ids,
@@ -60,6 +69,8 @@ def main(
     batch_size, seq_len = input_ids.shape
     input_ids = jnp.array(input_ids)
     attention_mask = jnp.array(attention_mask)
+    print(f"batch_size: {batch_size}, seq_len: {seq_len}")
+    print(f"attention_mask.shape: {attention_mask.shape}")
     flax_model = make_model(torch_config, torch_model)
     
     # for i in range(flax_model.config.num_hidden_layers):

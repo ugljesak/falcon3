@@ -329,9 +329,9 @@ class AttentionLayer(nn.Module):
             # Using custom cache class
             # key, value = kv_cache.update(key, value, cache_position, cos, sin)
             k_cached, v_cached = kv_cache
-            k_cached = k_cached.at[:, :, cache_position, :].set(key)
-            v_cached = v_cached.at[:, :, cache_position, :].set(value)
-            key, value = k_cached, v_cached
+            k_cached = k_cached.at[:, cache_position, :, :].set(key)
+            v_cached = v_cached.at[:, cache_position, :, :].set(value)
+            key, value = k_cached[:, :cache_position[-1], :, :], v_cached[:, :cache_position[-1], :, :]
             kv_cache = key, value
         # [batch_size, num_heads, seq_len, head_dim]
         (query, key, value) = [jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value)]
@@ -639,46 +639,59 @@ def configure_head_mask(head_mask : Optional[jax.Array], num_hidden_layers: int)
 
 def update_causal_mask(
     config: FalconConfig,
+    input_embeds: jax.Array,
     attention_mask: jax.Array,
+    kv_cache: Tuple[jax.Array, jax.Array],
     cache_position: jax.Array,
 ) -> jax.Array:
     """
     Update the causal mask for the model.
 
     Args:
+        input_embeds (`jax.Array`):
+            Input tensor of shape [batch_size, seq_len, hidden_size]
         attention_mask (`jax.Array`):
-            Attention mask of shape [seq_len, max_seq_len] or [batch_size, 1, seq_len, kv_length]
+            Attention mask of shape [seq_len, target_len] or [batch_size, 1, seq_len, kv_length]
         cache_position (`jax.Array`):
             Position IDs for cache
-        past_key_values (`KVCache`):
-            Key-Value cache for past key-value pairs
 
     Returns:
         Updated attention mask of shape [batch_size, 1, seq_len, seq_len]
     """
     if attention_mask is not None and attention_mask.ndim == 4:
+        # We assume here that the attention mask is already inverted form and requires 
+        # no inversion of slicing so we just return it in the same shape
         return attention_mask
 
-    # Attention mask: [batch_size, seq_len]
-    target_length = config.max_position_embeddings
-    batch_size, seq_len = attention_mask.shape
+    # [seq_len, target_length]
+    # Input embeds: [batch_size, seq_len, hidden_size]
+    batch_size, seq_len, _ = input_embeds.shape
+    target_length = attention_mask.shape[-1] if attention_mask is not None else kv_cache[0].shape[1] + seq_len
+    print(f"Comparing input_embeds seq_len {seq_len} with attention_mask seq_len {attention_mask.shape[0]}")
     min_dtype = jnp.finfo(getattr(config, "dtype", jnp.float32)).min
     print(f"min_dtype: {min_dtype}, attention_mask shape: {attention_mask.shape}")
+    
+    # Create causal mask of shape [seq_len, target_length] with all values set to -INF
     causal_mask = jnp.full((seq_len, target_length), fill_value=min_dtype, dtype=getattr(config, "dtype", jnp.float32))
     print(f"causal_mask shape: {causal_mask.shape}")
+    # Fill the main diagonal and lower triangular part of the mask with 0s
     if seq_len != 1:
         causal_mask = jnp.triu(causal_mask, k=1)
     print(f"cache_position shape: {cache_position.shape}")
-    causal_mask *= jnp.arange(target_length) > cache_position[:, None]
+    # Multiply causal mask with tensor of shape [seq_len, target_length]
+    causal_mask *= jnp.arange(target_length)[None, :] > cache_position[:, None]
     causal_mask = causal_mask[None, None, :, :].repeat(batch_size, axis=0)
     #causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, seq_len, target_length))
     
     if attention_mask is not None:
         mask_length = attention_mask.shape[-1]
-        
+        # Add padding mask to causal mask shape [batch_size, 1, seq_len, mask_length]:
         padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+        # Inverting padding mask
         padding_mask = padding_mask == 0
         
+        # Apply padding mask to causal mask for the first mask_length elements
+        # by setting them to min_dtype
         causal_mask = causal_mask.at[:, :, :, :mask_length].set(
             jnp.where(padding_mask, min_dtype, causal_mask[:, :, :, :mask_length])
         )
@@ -773,16 +786,20 @@ class FalconModel(FalconPreTrainedModel):
         
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
-        past_kv_len = kv_cache["key"].shape[-2] if kv_cache is not None else 0
+        past_kv_len = sum(kv_cache[0].shape[-2] > 0) if kv_cache is not None else 0
         if cache_position is None:
             cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
-        
+            print(f"Cache position is None, using past_kv_len {past_kv_len} and second dim of input_embeds shape {input_embeds.shape}")
+        else:
+            print(f"Cache position is not None, using cache_position {cache_position}")
         if position_ids is None:
             position_ids = cache_position[None, :]
 
         causal_mask = update_causal_mask(
             self.config,
+            input_embeds=input_embeds,
             attention_mask=attention_mask,
+            kv_cache=kv_cache,
             cache_position=cache_position
         )
 
@@ -1003,6 +1020,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
         
         # Initialize generation variables
         batch_size, seq_length = input_ids.shape
+        print(f"Generatiing with input_ids shape {input_ids.shape}")
         max_length = seq_length + max_new_tokens
         has_reached_eos = jnp.zeros(batch_size, dtype=jnp.bool_)
         
