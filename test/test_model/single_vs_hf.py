@@ -9,7 +9,7 @@ from model.convert_hf_weights import make_model
 
 
 def main(
-    model_name: str = "tiiuae/Falcon3-7B-Instruct",
+    model_name: str = "tiiuae/falcon-7b-instruct",
     prompt: str = (
     "Q: Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. "
     "She sells the remainder at the farmers' market daily for $2 per fresh duck egg. "
@@ -24,25 +24,26 @@ def main(
         token_id = tokenizer.convert_tokens_to_ids(token_str)
         print(f"{token_name}: {token_str} -> {token_id}")
 
-    torch_config = AutoConfig.from_pretrained(model_name)
-    torch_config.use_cache = True
-    torch_config.num_hidden_layers = 2
-    torch_config.layer_norm_epsilon = 1e-5
-    torch_config.hidden_dropout = 0.0
-    torch_config.parallel_attn = True
-    torch_config.num_ln_in_parallel_attn = 2
-    torch_config.new_decoder_architecture = False
-    torch_config.multi_query = True
+    torch_config = AutoConfig.from_pretrained(
+        model_name,
+        num_hidden_layers = 2
+    )
+    #torch_config.layer_norm_epsilon = 1e-5
+    #torch_config.hidden_dropout = 0.0
+    #torch_config.parallel_attn = True
+    #torch_config.num_ln_in_parallel_attn = 2
+    #torch_config.new_decoder_architecture = False
+    #torch_config.multi_query = True
     torch_config.group_query = False
-    torch_config.use_cache = True
-    torch_config.bias = False
+    #torch_config.use_cache = True
+    #torch_config.bias = False
+    print(torch_config)
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=torch_config,
         device_map="cpu",
         torch_dtype=torch.float32,
     )
-
 
     inputs = tokenizer(prompt, return_tensors="pt")
     batch_size = 3
@@ -71,6 +72,7 @@ def main(
     attention_mask = jnp.array(attention_mask)
     print(f"batch_size: {batch_size}, seq_len: {seq_len}")
     print(f"attention_mask.shape: {attention_mask.shape}")
+    print(f"Torch model class type: {type(torch_model)}")
     flax_model = make_model(torch_config, torch_model)
     
     # for i in range(flax_model.config.num_hidden_layers):

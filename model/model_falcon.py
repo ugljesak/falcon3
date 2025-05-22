@@ -323,16 +323,16 @@ class AttentionLayer(nn.Module):
             if kv_cache is None:
                 # Using custom cache class
                 # kv_cache = KVCache(self.config, batch_size, key, value)
-                k_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
-                v_cached = jnp.zeros((batch_size, self.config.num_attention_heads, self.config.max_position_embeddings, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
+                k_cached = jnp.zeros((batch_size, self.config.max_position_embeddings, self.config.num_attention_heads, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
+                v_cached = jnp.zeros((batch_size, self.config.max_position_embeddings, self.config.num_attention_heads, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
                 kv_cache = k_cached, v_cached
             # Using custom cache class
             # key, value = kv_cache.update(key, value, cache_position, cos, sin)
             k_cached, v_cached = kv_cache
             k_cached = k_cached.at[:, cache_position, :, :].set(key)
             v_cached = v_cached.at[:, cache_position, :, :].set(value)
-            key, value = k_cached[:, :cache_position[-1], :, :], v_cached[:, :cache_position[-1], :, :]
-            kv_cache = key, value
+            key, value = k_cached[:, :cache_position.shape[0], :, :], v_cached[:, :cache_position.shape[0], :, :]
+            kv_cache = k_cached, v_cached
         # [batch_size, num_heads, seq_len, head_dim]
         (query, key, value) = [jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value)]
         query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
@@ -395,7 +395,7 @@ class MLPBlock(nn.Module):
 
     def setup(self):
         self.hidden_size = self.config.hidden_size
-        self.ffn_hidden_size = self.config.ffn_hidden_size
+        self.ffn_hidden_size = getattr(self.config, "ffn_hidden_size", self.hidden_size * 4)
         self.layer_norm_epsilon = self.config.layer_norm_epsilon
         self.hidden_dropout = self.config.hidden_dropout
         
@@ -423,8 +423,11 @@ class MLPBlock(nn.Module):
         # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, hidden_size]
         self.dropout = nn.Dropout(rate=self.hidden_dropout)
 
-        if self.config.activation == "gelu":
+        act = getattr(self.config, 'activation', None) or getattr(self.config, 'hidden_act', None)
+        if act == "gelu":
             self.activation = nn.gelu
+        elif act == "silu":
+            self.activation = nn.silu
         else:
             self.activation = nn.relu
 

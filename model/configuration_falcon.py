@@ -8,12 +8,12 @@ from jax import numpy as jnp
 @dataclass
 class FalconConfig(PretrainedConfig):
     """Configuration class for Falcon model."""
-    vocab_size: int = 65024
-    hidden_size: int = 4544
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 71
+    vocab_size: int = 131072
+    hidden_size: int = 3072
+    num_hidden_layers: int = 28
+    num_attention_heads: int = 12
     num_kv_heads: Optional[int] = None
-    max_position_embeddings: int = 2048
+    max_position_embeddings: int = 32768
     layer_norm_epsilon: float = 1e-5
     initializer_range: float = 0.02
     use_cache: bool = True
@@ -32,7 +32,7 @@ class FalconConfig(PretrainedConfig):
     activation: str = "gelu"
     _attn_implementation: str = "eager"
     ffn_hidden_size: Optional[int] = None
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float16
     # Depricated attributes
     alibi: Optional[bool] = None
     pruned_heads = None
@@ -44,7 +44,9 @@ class FalconConfig(PretrainedConfig):
     def __post_init__(self):
 
         if self.num_kv_heads is None:
-            if self.multi_query:
+            if self.group_query:
+                self.num_kv_heads = 4
+            elif self.multi_query:
                 self.num_kv_heads = 1
             else:
                 self.num_kv_heads = self.num_attention_heads
