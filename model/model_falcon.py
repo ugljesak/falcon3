@@ -323,16 +323,17 @@ class AttentionLayer(nn.Module):
             if kv_cache is None:
                 # Using custom cache class
                 # kv_cache = KVCache(self.config, batch_size, key, value)
-                k_cached = jnp.zeros((batch_size, self.config.max_position_embeddings, self.config.num_attention_heads, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
-                v_cached = jnp.zeros((batch_size, self.config.max_position_embeddings, self.config.num_attention_heads, self.config.head_dim), dtype=getattr(self.config, "dtype", jnp.float32))
-                kv_cache = k_cached, v_cached
+                kv_cache = key, value 
             # Using custom cache class
             # key, value = kv_cache.update(key, value, cache_position, cos, sin)
-            k_cached, v_cached = kv_cache
-            k_cached = k_cached.at[:, cache_position, :, :].set(key)
-            v_cached = v_cached.at[:, cache_position, :, :].set(value)
-            key, value = k_cached[:, :cache_position.shape[0], :, :], v_cached[:, :cache_position.shape[0], :, :]
-            kv_cache = k_cached, v_cached
+            else:
+                k_cached, v_cached = kv_cache
+                *batch_dims, _, _, _ = k_cached.shape
+                indices = (1,) * len(batch_dims) + (cache_position, 0, 0)
+                key = jax.lax.dynamic_update_slice(k_cached, key, indices)
+                value = jax.lax.dynamic_update_slice(v_cached, value, indices)
+                kv_cache = key, value  
+
         # [batch_size, num_heads, seq_len, head_dim]
         (query, key, value) = [jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value)]
         query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
@@ -744,7 +745,7 @@ class FalconModel(FalconPreTrainedModel):
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
         head_mask: Optional[jax.Array] = None,
-        kv_cache: Optional[Union[KVCache, Tuple[jax.Array, jax.Array]]] = None,
+        kv_cache: Optional[Union[KVCache, list[Tuple[jax.Array, jax.Array]]]] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[jax.Array] = None,
         output_attentions: Optional[bool] = None,
@@ -787,9 +788,13 @@ class FalconModel(FalconPreTrainedModel):
         if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError("You have to specify exactly one of input_ids or input_embeds.")
         
+        if kv_cache is None:
+            kv_cache = [None for _ in range(len(self.config.num_hidden_layers))]
+
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
-        past_kv_len = sum(kv_cache[0].shape[-2] > 0) if kv_cache is not None else 0
+        
+        past_kv_len = kv_cache[0][0].shape[-2] if kv_cache[0] is not None else 0
         if cache_position is None:
             cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
             print(f"Cache position is None, using past_kv_len {past_kv_len} and second dim of input_embeds shape {input_embeds.shape}")
@@ -797,6 +802,8 @@ class FalconModel(FalconPreTrainedModel):
             print(f"Cache position is not None, using cache_position {cache_position}")
         if position_ids is None:
             position_ids = cache_position[None, :]
+
+
 
         causal_mask = update_causal_mask(
             self.config,
@@ -823,7 +830,7 @@ class FalconModel(FalconPreTrainedModel):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 use_cache=use_cache,
-                kv_cache=kv_cache,
+                kv_cache=kv_cache[i],
                 cache_position=cache_position,
                 head_mask=head_mask[i],
                 output_attentions=output_attentions,
@@ -834,7 +841,7 @@ class FalconModel(FalconPreTrainedModel):
             hidden_states = outputs[0]
             # Update cache if needed
             if use_cache:
-                next_decoder_cache = outputs[1]
+                kv_cache[i] = outputs[1]
             # Store attention scores if needed for every layer
             if output_attentions:
                 all_self_attentions += (outputs[2],)
@@ -844,17 +851,15 @@ class FalconModel(FalconPreTrainedModel):
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        next_cache = next_decoder_cache if use_cache else None
         
         if not return_dict:
             return Tuple( v for v in
-                [hidden_states, next_cache, all_hidden_states, all_self_attentions] 
+                [hidden_states, kv_cache, all_hidden_states, all_self_attentions] 
                 if v is not None)
         else:
             return BaseModelOutputWithPastAndCrossAttentions(
                 last_hidden_state=hidden_states,
-                past_key_values=next_cache,
+                past_key_values=kv_cache,
                 hidden_states=all_hidden_states,
                 attentions=all_self_attentions
             )
