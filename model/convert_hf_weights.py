@@ -40,4 +40,4 @@ def make_model(config: FalconConfig, torch_model: TorchFalconForCausalLM) -> Fal
         params_jax['params']['transformer'][blocks_i]['mlp']['dense_4h_to_h']['kernel'] = torch_to_jnp(torch_model.transformer.h[i].mlp.dense_4h_to_h.weight)
     params_jax['params']['lm_head']['kernel'] = torch_to_jnp(torch_model.lm_head.weight)
 
-    return jax_model
+    return jax_model, params_jax

@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from model.model_falcon import FalconForCausalLM
 from model.configuration_falcon import FalconConfig
 from model.convert_hf_weights import make_model
+from model.generate_model import generate
 
 
 def main(
@@ -73,7 +74,7 @@ def main(
     print(f"batch_size: {batch_size}, seq_len: {seq_len}")
     print(f"attention_mask.shape: {attention_mask.shape}")
     print(f"Torch model class type: {type(torch_model)}")
-    flax_model = make_model(torch_config, torch_model)
+    flax_model, flax_params = make_model(torch_config, torch_model)
     
     # for i in range(flax_model.config.num_hidden_layers):
     #     flax_model.model.layers[i].attn.cached_key = jnp.zeros((batch_size, max_len, 8, 128), dtype = jnp.float32)
@@ -83,7 +84,9 @@ def main(
     extended_attention_mask = jnp.ones((batch_size, max_len), dtype = "i4")
     extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
     # extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask_jax, (0, 0))
-    generated_ids = flax_model.generate(
+    generated_ids = generate(
+        params=flax_params,
+        model=flax_model,
         input_ids=input_ids,
         attention_mask=extended_attention_mask,
         max_new_tokens=max_len - seq_len 
