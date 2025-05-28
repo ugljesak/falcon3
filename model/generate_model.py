@@ -12,7 +12,7 @@ def generate(
     eos_token_id=None,
     position_ids = None,
 ):
-    """Generate text efficiently using properly initialized KV caching in NNX."""
+    """Generate text efficiently using properly initialized KV caching in NN."""
     # Set defaults for special tokens
     pad_token_id = pad_token_id if pad_token_id is not None else model.config.pad_token_id
     eos_token_id = eos_token_id if eos_token_id is not None else getattr(model.config, "eos_token_id", None)
@@ -62,7 +62,7 @@ def generate(
             params,
             input_ids=next_token,  # Only process the new token
             attention_mask=attention_mask,
-            init_cache=True,
+            use_cache=True,
             position_ids = new_position_ids
         )
         cur_len += 1

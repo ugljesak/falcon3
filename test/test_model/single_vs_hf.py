@@ -74,7 +74,7 @@ def main(
     print(f"batch_size: {batch_size}, seq_len: {seq_len}")
     print(f"attention_mask.shape: {attention_mask.shape}")
     print(f"Torch model class type: {type(torch_model)}")
-    flax_model, flax_params = make_model(torch_config, torch_model)
+    flax_model, flax_params = make_model(torch_config, torch_model, batch_size, seq_len, inpui)
     
     # for i in range(flax_model.config.num_hidden_layers):
     #     flax_model.model.layers[i].attn.cached_key = jnp.zeros((batch_size, max_len, 8, 128), dtype = jnp.float32)

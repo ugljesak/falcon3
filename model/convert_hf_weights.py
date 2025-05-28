@@ -1,6 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
+from typing import Optional
 from .model_falcon import FalconForCausalLM
 from .configuration_falcon import FalconConfig
 from transformers.models.falcon.modeling_falcon import FalconForCausalLM as TorchFalconForCausalLM
@@ -14,7 +15,14 @@ def torch_to_jnp(tensor):
     
     return jax_array
 
-def make_model(config: FalconConfig, torch_model: TorchFalconForCausalLM) -> FalconForCausalLM:
+def make_model(
+    config: FalconConfig,
+    torch_model: TorchFalconForCausalLM,
+    batch_size: Optional[int] = None,
+    seq_len: Optional[int] = None,
+    input_ids: Optional[jax.Array] = None,
+    attention_mask: Optional[jax.Array] = None
+    ) -> FalconForCausalLM:
     """
     Convert a Hugging Face Falcon model to a JAX Falcon model.
     """
@@ -23,12 +31,12 @@ def make_model(config: FalconConfig, torch_model: TorchFalconForCausalLM) -> Fal
     # Initialize dummy JAX model parameters
     # This is necessary to create the model structure
     # and to ensure that the parameters are in the correct format
-    batch_size = 2
-    seq_len = 50
-    x_jax = jnp.array(np.random.randint(0, config.vocab_size, size=(batch_size, seq_len), dtype=np.int32))
-    attention_mask_jax = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
+    # batch_size = 2
+    # seq_len = 50
+    # x_jax = jnp.array(np.random.randint(0, config.vocab_size, size=(batch_size, seq_len), dtype=np.int32))
+    # attention_mask_jax = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
     position_ids_jax = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
-    params_jax = jax_model.init(jax.random.PRNGKey(69), input_ids=x_jax, input_embeds=None, attention_mask=attention_mask_jax, position_ids=position_ids_jax)
+    params_jax = jax_model.init(jax.random.PRNGKey(69), input_ids=input_ids, input_embeds=None, attention_mask=attention_mask, position_ids=position_ids_jax)
 
     # Copy weights from torch to jax
     params_jax['params']['transformer']['word_embeddings']['embedding'] = torch_to_jnp(torch_model.transformer.word_embeddings.weight)
