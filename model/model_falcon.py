@@ -321,11 +321,11 @@ class AttentionLayer(nn.Module):
         
         # [batch_size, num_heads, seq_len, head_dim]
         (query, key, value) = [jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value)]
-        query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
+        #query = jnp.reshape(query, (batch_size, self.num_heads, seq_len, self.head_dim))
         # [batch_size, num_kv_heads, seq_len, head_dim]
-        key = jnp.reshape(key, (batch_size, self.num_kv_heads, seq_len, self.head_dim))
+        #key = jnp.reshape(key, (batch_size, self.num_kv_heads, seq_len, self.head_dim))
         # [batch_size, num_kv_heads, seq_len, head_dim]
-        value = jnp.reshape(value, (batch_size, self.num_kv_heads, seq_len, self.head_dim))
+        #value = jnp.reshape(value, (batch_size, self.num_kv_heads, seq_len, self.head_dim))
         if position_embeddings is None:
             cos, sin = self.rope(hidden_states, position_ids)
         else:
@@ -651,17 +651,13 @@ def update_causal_mask(
     # Input embeds: [batch_size, seq_len, hidden_size]
     batch_size, seq_len, _ = input_embeds.shape
     target_length = attention_mask.shape[-1] if attention_mask is not None else kv_cache[0].shape[1] + seq_len
-    print(f"Comparing input_embeds seq_len {seq_len} with attention_mask seq_len {attention_mask.shape[0]}")
     min_dtype = jnp.finfo(getattr(config, "dtype", jnp.float32)).min
-    print(f"min_dtype: {min_dtype}, attention_mask shape: {attention_mask.shape}")
     
     # Create causal mask of shape [seq_len, target_length] with all values set to -INF
     causal_mask = jnp.full((seq_len, target_length), fill_value=min_dtype, dtype=getattr(config, "dtype", jnp.float32))
-    print(f"causal_mask shape: {causal_mask.shape}")
     # Fill the main diagonal and lower triangular part of the mask with 0s
     if seq_len != 1:
         causal_mask = jnp.triu(causal_mask, k=1)
-    print(f"cache_position shape: {cache_position.shape}")
     # Multiply causal mask with tensor of shape [seq_len, target_length]
     causal_mask *= jnp.arange(target_length)[None, :] > cache_position[:, None]
     causal_mask = causal_mask[None, None, :, :].repeat(batch_size, axis=0)
@@ -782,7 +778,6 @@ class FalconModel(nn.Module):
             print(f"Cache position is not None, using cache_position {cache_position}")
         if position_ids is None:
             position_ids = cache_position[None, :]
-
 
 
         causal_mask = update_causal_mask(

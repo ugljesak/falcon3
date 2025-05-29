@@ -26,10 +26,13 @@ def generate(
     
     position_ids = jnp.cumsum(attention_mask, axis=-1) - 1 if position_ids is None else position_ids
     # Now process the real prompt to fill in the cache for actual tokens
+    print("First pass to fill cache with input tokens")
+    print(f"Input IDs shape: {input_ids.shape}, Position IDs shape: {position_ids.shape}")
+    print(f"Attention Mask shape: {attention_mask.shape if attention_mask is not None else 'None'}")
     outputs = model.apply(
         params,
         input_ids=input_ids,
-        position_ids=position_ids,
+        #position_ids=position_ids,
         attention_mask=attention_mask,
         use_cache=True,
         return_dict=True,

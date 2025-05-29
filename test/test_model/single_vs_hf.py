@@ -19,12 +19,7 @@ def main(
 ):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # Print all special tokens and their IDs
-    for token_name in tokenizer.special_tokens_map:
-        token_str = tokenizer.special_tokens_map[token_name]
-        token_id = tokenizer.convert_tokens_to_ids(token_str)
-        print(f"{token_name}: {token_str} -> {token_id}")
-
+    
     torch_config = AutoConfig.from_pretrained(
         model_name,
         num_hidden_layers = 2
@@ -38,7 +33,6 @@ def main(
     torch_config.group_query = False
     #torch_config.use_cache = True
     #torch_config.bias = False
-    print(torch_config)
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=torch_config,
@@ -47,10 +41,12 @@ def main(
     )
 
     inputs = tokenizer(prompt, return_tensors="pt")
-    batch_size = 3
+    batch_size = 1
     seq_len = 10
     input_ids = inputs.input_ids.to(torch_model.device)
     attention_mask = inputs.attention_mask.to(torch_model.device)
+    for x, y in zip(inputs.keys(), inputs.values()):
+        print(f"{x}: {y.shape} {y.dtype} {y.device}")
     print("eos_token_id in input_ids:", tokenizer.eos_token_id in input_ids[0])
     #input_ids = torch.randint(torch_config.vocab_size, (8, 10)).long()
     #attention_mask = torch.ones_like(input_ids)
@@ -60,6 +56,7 @@ def main(
         attention_mask=attention_mask
     )
     max_len = outputs[0].shape[0]
+    print("MAX LEN:", max_len)
     result = tokenizer.decode(outputs[0], skip_special_tokens=False)
     if result.startswith("<|begin_of_text|>"):
         result = result[len("<|begin_of_text|>"):].lstrip()
@@ -71,10 +68,11 @@ def main(
     batch_size, seq_len = input_ids.shape
     input_ids = jnp.array(input_ids)
     attention_mask = jnp.array(attention_mask)
+    print("Tester for HF and Flax models")
     print(f"batch_size: {batch_size}, seq_len: {seq_len}")
     print(f"attention_mask.shape: {attention_mask.shape}")
     print(f"Torch model class type: {type(torch_model)}")
-    flax_model, flax_params = make_model(torch_config, torch_model, batch_size, seq_len, inpui)
+    flax_model, flax_params = make_model(torch_config, torch_model, batch_size, seq_len, input_ids, attention_mask)
     
     # for i in range(flax_model.config.num_hidden_layers):
     #     flax_model.model.layers[i].attn.cached_key = jnp.zeros((batch_size, max_len, 8, 128), dtype = jnp.float32)
@@ -103,4 +101,6 @@ def main(
     print("\n🧠 OutputHF:\n", result) 
     print(f"Comparation of hf and flax models: {np.array(result_jax) == np.array(result)}")
 
-main()
+
+if __name__ == "__main__":
+    main()
