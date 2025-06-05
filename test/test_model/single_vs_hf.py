@@ -24,15 +24,15 @@ def main(
         model_name,
         num_hidden_layers = 2
     )
-    #torch_config.layer_norm_epsilon = 1e-5
-    #torch_config.hidden_dropout = 0.0
-    #torch_config.parallel_attn = True
-    #torch_config.num_ln_in_parallel_attn = 2
-    #torch_config.new_decoder_architecture = False
-    #torch_config.multi_query = True
+    torch_config.layer_norm_epsilon = 1e-5
+    torch_config.hidden_dropout = 0.0
+    torch_config.parallel_attn = True
+    torch_config.num_ln_in_parallel_attn = 2
+    torch_config.new_decoder_architecture = False
+    torch_config.multi_query = True
     torch_config.group_query = False
-    #torch_config.use_cache = True
-    #torch_config.bias = False
+    torch_config.use_cache = True
+    torch_config.bias = False
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=torch_config,
@@ -89,8 +89,10 @@ def main(
         attention_mask=extended_attention_mask,
         max_new_tokens=max_len - seq_len 
     )
-    print(generated_ids.shape)
+    print(f"My model: {generated_ids.shape}")
     print(generated_ids)
+    print(f"HF model: {outputs[0].shape}")
+    print(outputs[0])
     result_jax = tokenizer.decode(torch.tensor(generated_ids[0]), skip_special_tokens=False)
     if result_jax.startswith("<|begin_of_text|>"):
         result_jax = result_jax[len("<|begin_of_text|>"):].lstrip()
