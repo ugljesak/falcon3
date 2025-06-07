@@ -22,22 +22,23 @@ def main(
     
     torch_config = AutoConfig.from_pretrained(
         model_name,
-        num_hidden_layers = 2
+        num_hidden_layers = 1
     )
-    torch_config.layer_norm_epsilon = 1e-5
-    torch_config.hidden_dropout = 0.0
-    torch_config.parallel_attn = True
-    torch_config.num_ln_in_parallel_attn = 2
-    torch_config.new_decoder_architecture = False
-    torch_config.multi_query = True
+    # torch_config.layer_norm_epsilon = 1e-5
+    # torch_config.hidden_dropout = 0.0
+    # torch_config.parallel_attn = True
+    # torch_config.num_ln_in_parallel_attn = 2
+    # torch_config.new_decoder_architecture = False
+    # torch_config.multi_query = True
     torch_config.group_query = False
-    torch_config.use_cache = True
-    torch_config.bias = False
+    print(torch_config)
+    # torch_config.use_cache = True
+    # torch_config.bias = False
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=torch_config,
         device_map="cpu",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
     )
 
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -96,12 +97,13 @@ def main(
     result_jax = tokenizer.decode(torch.tensor(generated_ids[0]), skip_special_tokens=False)
     if result_jax.startswith("<|begin_of_text|>"):
         result_jax = result_jax[len("<|begin_of_text|>"):].lstrip()
-    if result.startswith(prompt):
+    if result_jax.startswith(prompt):
         result_jax = result_jax[len(prompt):].lstrip()
-    print("OutputJax:", result_jax)
-
-    print("\n🧠 OutputHF:\n", result) 
-    print(f"Comparation of hf and flax models: {np.array(result_jax) == np.array(result)}")
+    
+    print("Prompt:\n", prompt)
+    print("OutputJax:\n", result_jax)
+    print("🧠 OutputHF:\n", result) 
+    print(f"Comparation of hf and flax models: {result_jax == result}")
 
 
 if __name__ == "__main__":

@@ -188,7 +188,7 @@ def split_heads(fused_qkv: jax.Array, config: FalconConfig) -> Tuple[jax.Array, 
     batch_size, seq_len, _ = fused_qkv.shape
     # `num_kv_heads` kv's shared by `num_heads` heads
     # `num_kv_heads` must be divisible by `num_heads`
-    if config.group_query:
+    if config.group_query or config.new_decoder_architecture:
         # We split the last dimension into (num_kv_heads, num_heads/num_kv_heads + 2, head_dim)
         # [batch_size, seq_len, num_kv_heads, num_heads/num_kv_heads + 2, head_dim]
         qkv = jnp.reshape(fused_qkv, (batch_size, seq_len, -1, config.num_attention_heads // config.num_kv_heads + 2, config.head_dim))
@@ -479,7 +479,7 @@ class DecoderLayer(nn.Module):
         else:
             # Default to 2 if not specified
             if self.config.num_ln_in_parallel_attn is None:
-                self.config.num_ln_in_parallel_attn = 2
+                self.config.num_ln_in_parallel_attn = 1
             
             #                      /-> attention -\
             # input -> layernorm -<                >-> output
