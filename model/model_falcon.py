@@ -334,20 +334,25 @@ class AttentionLayer(nn.Module):
         
         # Use cached key and value if available
         if use_cache:
-            if kv_cache is None:
-                # Using custom cache class
-                # kv_cache = KVCache(self.config, batch_size, key, value)
-                kv_cache = key, value 
-            # Using custom cache class
-            # key, value = kv_cache.update(key, value, cache_position, cos, sin)
+            if kv_cache is None or kv_cache[0] is None:
+                k_cache = key
+                v_cache = value
+                kv_cache = (k_cache, v_cache)
             else:
-                k_cached, v_cached = kv_cache
-                *batch_dims, _, _, _ = k_cached.shape
-                indices = (1,) * len(batch_dims) + (cache_position, 0, 0)
-                key = jax.lax.dynamic_update_slice(k_cached, key, indices)
-                value = jax.lax.dynamic_update_slice(v_cached, value, indices)
-                kv_cache = key, value  
-
+                if cache_position is None:
+                    # Append new key and value to cache
+                    k_cache, v_cache = kv_cache
+                    key = jnp.concatenate((k_cache, key), axis=2)
+                    value = jnp.concatenate((v_cache, value), axis=2)
+                    kv_cache = (key, value)
+                else:
+                    # Update key and value caches at the specified position
+                    k_cache, v_cache = kv_cache
+                    *batch_dims, num_heads, length, head_dim = k_cache.shape
+                    indices = (0,) * len(batch_dims) + (0, length, 0)
+                    key = jax.lax.dynamic_update_slice(k_cache, key, indices)
+                    value = jax.lax.dynamic_update_slice(v_cache, value, indices)
+                    kv_cache = (key, value)
 
         # [batch_size, num_heads, seq_len, head_dim] @
         # [batch_size, num_heads, head_dim, seq_len] =
@@ -357,11 +362,13 @@ class AttentionLayer(nn.Module):
         #print(f"Attention shape {attention_scores.shape}")
 
         # Attention mask: [batch_size, 1, seq_len, max_seq_len]
+        print("Attention mask shape:", attention_mask.shape)
+        print("key shape:", key.shape)
         if attention_mask is not None:
             # [batch_size, 1, seq_len, seq_len]
-            attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+            attention_mask = attention_mask[:, :, -seq_len:, : key.shape[-2]]
             # [batch_size, num_heads, seq_len, seq_len]
-            attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, seq_len))
+            attention_mask = jnp.broadcast_to(attention_mask, (batch_size, self.num_heads, seq_len, key.shape[-2]))
         
         # Apply attention mask
         attention_scores = nn.softmax(attention_scores + attention_mask, axis=-1)
@@ -764,21 +771,28 @@ class FalconModel(nn.Module):
         if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError("You have to specify exactly one of input_ids or input_embeds.")
         
-        if kv_cache is None:
-            kv_cache = [None for _ in range(self.config.num_hidden_layers)]
-
         if input_embeds is None:
             input_embeds = self.word_embeddings(input_ids)
         
-        past_kv_len = kv_cache[0][0].shape[-2] if kv_cache[0] is not None else 0
+        if kv_cache is not None:
+            kv_cache = kv_cache if isinstance(kv_cache, list) else [kv_cache for _ in range(self.config.num_hidden_layers)]
+        else:
+            kv_cache = [(None, None) for _ in range(self.config.num_hidden_layers)]
+
+        # past_kv_len = kv_cache[0][0].shape[-2] if self.kv_cache[0][0] is not None else 0
+        if position_ids is None:
+            position_ids = jnp.arange(
+                start=0,
+                stop=input_embeds.shape[1],
+                step=1,
+                dtype=jnp.int32
+            )[None, :].repeat(input_embeds.shape[0], axis=0)
         if cache_position is None:
-            cache_position = jnp.arange(past_kv_len, past_kv_len + input_embeds.shape[1], dtype=jnp.int32)
-            print(f"Cache position is None, using past_kv_len {past_kv_len} and second dim of input_embeds shape {input_embeds.shape}")
+            cache_position = position_ids[0]
+            print(f"Cache position is None, using position_ids {position_ids.shape} and second dim of input_embeds shape {input_embeds.shape}")
         else:
             print(f"Cache position is not None, using cache_position {cache_position}")
-        if position_ids is None:
-            position_ids = cache_position[None, :]
-
+        
 
         causal_mask = update_causal_mask(
             self.config,
@@ -805,7 +819,7 @@ class FalconModel(nn.Module):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 use_cache=use_cache,
-                kv_cache=kv_cache[i],
+                kv_cache=kv_cache[i] if use_cache else None,
                 cache_position=cache_position,
                 head_mask=head_mask[i],
                 output_attentions=output_attentions,
@@ -816,7 +830,7 @@ class FalconModel(nn.Module):
             hidden_states = outputs[0]
             # Update cache if needed
             if use_cache:
-                kv_cache[i] = outputs[1]
+                kv_cache[i] = outputs[1]    
             # Store attention scores if needed for every layer
             if output_attentions:
                 all_self_attentions += (outputs[2],)

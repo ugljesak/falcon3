@@ -29,10 +29,11 @@ def generate(
     print("First pass to fill cache with input tokens")
     print(f"Input IDs shape: {input_ids.shape}, Position IDs shape: {position_ids.shape}")
     print(f"Attention Mask shape: {attention_mask.shape if attention_mask is not None else 'None'}")
+    print(f"Position IDs: {position_ids}")
     outputs = model.apply(
         params,
         input_ids=input_ids,
-        #position_ids=position_ids,
+        position_ids=position_ids[:, :seq_length],  # Use only the initial sequence length
         attention_mask=attention_mask,
         use_cache=True,
         return_dict=True,
@@ -55,18 +56,21 @@ def generate(
     # Start auto-regressive generation loop
     for i in range(1, max_new_tokens):
         # Early exit if all sequences have reached EOS
-        print(i) #just to track tokens
+        print("------", i, "------") #just to track tokens
         if eos_token_id is not None and jnp.all(has_reached_eos):
             break
         
+        past_key_values = outputs.past_key_values
         # Generate next token using cache
         new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
+        print(f"New position IDs: {new_position_ids}")
         outputs = model.apply(
             params,
             input_ids=next_token,  # Only process the new token
             attention_mask=attention_mask,
             use_cache=True,
-            position_ids = new_position_ids
+            kv_cache=past_key_values,
+            position_ids = new_position_ids,
         )
         cur_len += 1
         # Get logits and predict next token

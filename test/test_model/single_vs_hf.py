@@ -22,7 +22,7 @@ def main(
     
     torch_config = AutoConfig.from_pretrained(
         model_name,
-        num_hidden_layers = 1
+        num_hidden_layers = 2
     )
     # torch_config.layer_norm_epsilon = 1e-5
     # torch_config.hidden_dropout = 0.0
