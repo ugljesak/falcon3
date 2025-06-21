@@ -76,3 +76,6 @@ input_embeds: [1, 5, 3072] (float32)  # hidden_size = 3072
   ↓ lm_head: [1, 5, 131072]  # vocab_size = 131072
 ↓ tokenization: decode to text          # ['The', ' biggest', ' building', ...]
 Output prompt: The biggest building...
+
+39133  49250  46478 102836  72527  40810 121550   4032  29459  84001
+ 104303  23113  53708   7322  90734 130701  57315   5935  90591   2528]

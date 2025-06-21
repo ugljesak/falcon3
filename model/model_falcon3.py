@@ -2,7 +2,8 @@
 """Flax Falcon3 model."""
 
 from functools import partial
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -13,13 +14,15 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
 from model.configuration_falcon3 import Falcon3Config
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 
-def create_sinusoidal_positions(num_pos, dim):
-    inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
-    freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype(jnp.float16)
+def create_sinusoidal_positions(num_pos, theta, dim):
+    inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2) / dim))
+    freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype(jnp.float32)
 
     emb = np.concatenate((freqs, freqs), axis=-1)
     out = np.concatenate((np.sin(emb)[:, None, :], np.cos(emb)[:, None, :]), axis=-1)
@@ -40,14 +43,14 @@ def apply_rotary_pos_emb(tensor, sin_pos, cos_pos):
 
 class FlaxFalcon3RMSNorm(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.epsilon = self.config.rms_norm_eps
         self.weight = self.param("weight", lambda _, shape: jnp.ones(shape), self.config.hidden_size)
 
     def __call__(self, hidden_states):
-        variance = jnp.asarray(hidden_states, dtype=jnp.float16)
+        variance = jnp.asarray(hidden_states, dtype=jnp.float32)
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
         # use `jax.numpy.sqrt` as `jax.lax.rsqrt` does not match `torch.rsqrt`
@@ -58,16 +61,15 @@ class FlaxFalcon3RMSNorm(nn.Module):
 
 class FlaxFalcon3RotaryEmbedding(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.sincos = create_sinusoidal_positions(self.config.max_position_embeddings, head_dim)
+        self.sincos = create_sinusoidal_positions(self.config.max_position_embeddings, self.config.rope_theta, head_dim)
 
     def __call__(self, key, query, position_ids):
         sincos = self.sincos[position_ids]
         sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
-
         key = apply_rotary_pos_emb(key, sin_pos, cos_pos)
         query = apply_rotary_pos_emb(query, sin_pos, cos_pos)
 
@@ -79,7 +81,7 @@ class FlaxFalcon3RotaryEmbedding(nn.Module):
 
 class FlaxFalcon3Attention(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
     causal: bool = True
     is_cross_attention: bool = False
 
@@ -90,7 +92,7 @@ class FlaxFalcon3Attention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.attention_softmax_in_fp32 = self.dtype is not jnp.float16
+        self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
         dense = partial(
             nn.Dense,
@@ -113,7 +115,6 @@ class FlaxFalcon3Attention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
     @nn.compact
-    # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoSelfAttention._concatenate_to_cache
     def _concatenate_to_cache(self, key, value, query, attention_mask):
         """
         This function takes projected key, value states from a single input token and concatenates the states to cached
@@ -161,9 +162,8 @@ class FlaxFalcon3Attention(nn.Module):
         query = self._split_heads(query, self.num_heads)
         key = self._split_heads(key, self.num_key_value_heads)
         value = self._split_heads(value, self.num_key_value_heads)
-
+        
         key, query = self.rotary_emb(key, query, position_ids)
-
         query_length, key_length = query.shape[1], key.shape[1]
 
         if self.has_variable("cache", "cached_key"):
@@ -174,12 +174,13 @@ class FlaxFalcon3Attention(nn.Module):
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-        attention_mask = combine_masks(attention_mask, causal_mask)
+        if attention_mask is not None:
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = combine_masks(attention_mask, causal_mask)
+        else:
+            attention_mask = causal_mask
 
         dropout_rng = None
         if not deterministic and self.config.attention_dropout > 0.0:
@@ -201,7 +202,8 @@ class FlaxFalcon3Attention(nn.Module):
         )
 
         # usual dot product attention
-        attention_dtype = jnp.float16 if self.attention_softmax_in_fp32 else self.dtype
+        attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
+        
         attn_weights = dot_product_attention_weights(
             query,
             key,
@@ -211,21 +213,20 @@ class FlaxFalcon3Attention(nn.Module):
             deterministic=deterministic,
             dtype=attention_dtype,
         )
-
         if self.attention_softmax_in_fp32:
             attn_weights = attn_weights.astype(self.dtype)
 
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
-
+        
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
 
 
 class FlaxFalcon3MLP(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         embed_dim = self.config.hidden_size
@@ -248,7 +249,7 @@ class FlaxFalcon3MLP(nn.Module):
 
 class FlaxFalcon3DecoderLayer(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.input_layernorm = FlaxFalcon3RMSNorm(self.config, dtype=self.dtype)
@@ -278,7 +279,6 @@ class FlaxFalcon3DecoderLayer(nn.Module):
         # residual connection
         attn_output = outputs[0]
         hidden_states = residual + attn_output
-
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -287,142 +287,9 @@ class FlaxFalcon3DecoderLayer(nn.Module):
 
         return (hidden_states,) + outputs[1:]
 
-
-# Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoPreTrainedModel with GPTNeo->Falcon3, GPT_NEO->Falcon3, transformer->model
-class FlaxFalcon3PreTrainedModel():
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
-
-    config_class = Falcon3Config
-    base_model_prefix = "model"
-    module_class: nn.Module = None
-
-    def __init__(
-        self,
-        config: Falcon3Config,
-        input_shape: Tuple = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float16,
-        _do_init: bool = True,
-        **kwargs,
-    ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
-
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        # init input tensors
-        input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
-        params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
-
-        random_params = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)["params"]
-
-        if params is not None:
-            random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
-            return freeze(unflatten_dict(params))
-        else:
-            return random_params
-
-    def init_cache(self, batch_size, max_length):
-        r"""
-        Args:
-            batch_size (`int`):
-                batch_size used for fast auto-regressive decoding. Defines the batch size of the initialized cache.
-            max_length (`int`):
-                maximum possible length for auto-regressive decoding. Defines the sequence length of the initialized
-                cache.
-        """
-        # init input variables to retrieve cache
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
-        )
-        return unfreeze(init_variables["cache"])
-
-    def __call__(
-        self,
-        input_ids,
-        attention_mask=None,
-        position_ids=None,
-        params: Optional[dict] = None,
-        past_key_values: Optional[dict] = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-        batch_size, sequence_length = input_ids.shape
-
-        if position_ids is None:
-            if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
-
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
-
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length))
-
-        # Handle any PRNG if needed
-        rngs = {}
-        if dropout_rng is not None:
-            rngs["dropout"] = dropout_rng
-
-        inputs = {"params": params or self.params}
-
-        # if past_key_values are passed then cache is already initialized a private flag init_cache has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that it can be changed by FlaxFalcon3Attention module
-        if past_key_values:
-            inputs["cache"] = past_key_values
-            mutable = ["cache"]
-        else:
-            mutable = False
-
-        outputs = self.module.apply(
-            inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            not train,
-            False,
-            output_attentions,
-            output_hidden_states,
-            return_dict,
-            rngs=rngs,
-            mutable=mutable,
-        )
-
-        # add updated cache to model output
-        if past_key_values is not None and return_dict:
-            outputs, past_key_values = outputs
-            outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-            return outputs
-        elif past_key_values is not None and not return_dict:
-            outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-        return outputs
-
-
 class FlaxFalcon3LayerCollection(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.blocks = [
@@ -445,7 +312,7 @@ class FlaxFalcon3LayerCollection(nn.Module):
         all_hidden_states = () if output_hidden_states else None
 
         for block in self.blocks:
-            print(f"Processing block {block.name}")
+            print(f"Processing block {block.name}...")  # Debugging output
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
@@ -467,9 +334,9 @@ class FlaxFalcon3LayerCollection(nn.Module):
         return outputs
 
 
-class FlaxFalcon3Module(nn.Module):
+class FlaxFalcon3Model(nn.Module):
     config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.hidden_size = self.config.hidden_size
@@ -495,7 +362,6 @@ class FlaxFalcon3Module(nn.Module):
         return_dict: bool = True,
     ):
         input_embeds = self.embed_tokens(input_ids.astype("i4"))
-
         outputs = self.layers(
             input_embeds,
             position_ids=position_ids,
@@ -509,7 +375,6 @@ class FlaxFalcon3Module(nn.Module):
 
         hidden_states = outputs[0]
         hidden_states = self.norm(hidden_states)
-
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
             outputs = (hidden_states, all_hidden_states) + outputs[2:]
@@ -524,24 +389,65 @@ class FlaxFalcon3Module(nn.Module):
             'hidden_states': outputs[1],
             'attentions': outputs[-1],
         }
-
-
-class FlaxFalcon3Model(FlaxFalcon3PreTrainedModel):
-    module_class = FlaxFalcon3Module
-
-
-class FlaxFalcon3ForCausalLMModule(nn.Module):
-    config: Falcon3Config
-    dtype: jnp.dtype = jnp.float16
+    
+class FlaxFalcon3ForCausalLM(nn.Module):
+    config: LlamaConfig
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.model = FlaxFalcon3Module(self.config, dtype=self.dtype)
+        self.model = FlaxFalcon3Model(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
         )
+
+    def init_cache(self, batch_size, max_length):
+        r"""
+        Args:
+            batch_size (`int`):
+                batch_size used for fast auto-regressive decoding. Defines the batch size of the initialized cache.
+            max_length (`int`):
+                maximum possible length for auto-regressive decoding. Defines the sequence length of the initialized
+                cache.
+        """
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+
+        init_variables = self.init(
+            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+        )
+        return unfreeze(init_variables["cache"])
+
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+        batch_size, seq_length = input_ids.shape
+
+        # initializing the cache
+        past_key_values = self.init_cache(batch_size, max_length)
+        
+        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
+        # But since Falcon3 uses a causal mask, those positions are masked anyways.
+        # Thus we can create a single static attention_mask here, which is more efficient for compilation
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = extended_attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+
+        return {
+            "past_key_values": past_key_values,
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs['past_key_values']
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
 
     def __call__(
         self,
@@ -570,7 +476,6 @@ class FlaxFalcon3ForCausalLMModule(nn.Module):
         else:
             hidden_states = outputs['last_hidden_state']
         lm_logits = self.lm_head(hidden_states)
-
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
@@ -579,34 +484,3 @@ class FlaxFalcon3ForCausalLMModule(nn.Module):
             'hidden_states': outputs['hidden_states'],
             'attentions': outputs['attentions']
         }
-
-
-# Copied from transformers.models.gptj.modeling_flax_gptj.FlaxGPTJForCausalLM with GPTJ->Falcon3
-class FlaxFalcon3ForCausalLM(FlaxFalcon3PreTrainedModel):
-    module_class = FlaxFalcon3ForCausalLMModule
-
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
-        # initializing the cache
-        batch_size, seq_length = input_ids.shape
-
-        past_key_values = self.init_cache(batch_size, max_length)
-        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
-        # But since Falcon3 uses a causal mask, those positions are masked anyways.
-        # Thus we can create a single static attention_mask here, which is more efficient for compilation
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-        if attention_mask is not None:
-            position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
-        else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
-
-        return {
-            "past_key_values": past_key_values,
-            "attention_mask": extended_attention_mask,
-            "position_ids": position_ids,
-        }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs

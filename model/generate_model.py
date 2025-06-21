@@ -1,7 +1,13 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
+import torch
 from .model_falcon import FalconForCausalLM
+from test.test_utils import compare_results
+from model.convert_hf_weights import torch_to_jnp
 
+
+@jax.jit
 def generate(
     model: FalconForCausalLM,
     params,
@@ -10,6 +16,7 @@ def generate(
     max_new_tokens=20,
     pad_token_id=None,
     eos_token_id=None,
+    past_key_values=None,
     position_ids = None,
 ):
     """Generate text efficiently using properly initialized KV caching in NN."""
@@ -19,69 +26,57 @@ def generate(
     
     # Initialize generation variables
     batch_size, seq_length = input_ids.shape
-    print(f"Generatiing with input_ids shape {input_ids.shape}")
-    max_length = seq_length + max_new_tokens
     has_reached_eos = jnp.zeros(batch_size, dtype=jnp.bool_)
     
-    
     position_ids = jnp.cumsum(attention_mask, axis=-1) - 1 if position_ids is None else position_ids
-    # Now process the real prompt to fill in the cache for actual tokens
-    print("First pass to fill cache with input tokens")
-    print(f"Input IDs shape: {input_ids.shape}, Position IDs shape: {position_ids.shape}")
-    print(f"Attention Mask shape: {attention_mask.shape if attention_mask is not None else 'None'}")
-    print(f"Position IDs: {position_ids}")
-    outputs = model.apply(
-        params,
+    print(f"Initial pass for loading cache into model...")
+    outputs, cache = model.apply(
+        {'params': params['params'], 'cache': past_key_values},
         input_ids=input_ids,
-        position_ids=position_ids[:, :seq_length],  # Use only the initial sequence length
         attention_mask=attention_mask,
-        use_cache=True,
+        position_ids=position_ids[:, :seq_length],
         return_dict=True,
+        #init_cache=True,
+        mutable=['cache'],
     )
-    # Get next token prediction
-    next_token_logits = outputs.logits[:, -1, :]
+    #breakpoint()  # For debugging purposes, you can remove this line later
+    
+    # Get cache, logits and predict next token
+    next_token_logits = outputs['logits'][:, -1, :]
     next_token = jnp.argmax(next_token_logits, axis=-1)
     next_token = next_token[:, None]  # Add sequence dimension
-    
-    # # Add first generated token
     all_token_ids = jnp.concatenate([input_ids, next_token], axis=1)
-    
-    # Track current sequence length
-    
-    # Check early stopping conditions
+    cache = cache['cache']
     if eos_token_id is not None:
-        has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
+        has_reached_eos |= (next_token[:, 0] == eos_token_id)
 
+    
+    print(f"Auto-regressive generation to predict next tokens...")
     cur_len = seq_length
     # Start auto-regressive generation loop
+
     for i in range(1, max_new_tokens):
-        # Early exit if all sequences have reached EOS
         print("------", i, "------") #just to track tokens
         if eos_token_id is not None and jnp.all(has_reached_eos):
             break
         
-        past_key_values = outputs.past_key_values
-        # Generate next token using cache
-        new_position_ids = position_ids[:, cur_len].reshape(-1, 1)
-        print(f"New position IDs: {new_position_ids}")
-        outputs = model.apply(
-            params,
+        outputs, cache = model.apply(
+            {'params': params['params'], 'cache': cache},
             input_ids=next_token,  # Only process the new token
             attention_mask=attention_mask,
-            use_cache=True,
-            kv_cache=past_key_values,
-            position_ids = new_position_ids,
+            position_ids = position_ids[:, cur_len].reshape(-1, 1),
+            return_dict=True,
+            mutable=['cache'],
         )
-        cur_len += 1
-        # Get logits and predict next token
-        next_token_logits = outputs.logits[:, -1, :]
+        # Get cache, logits and predict next token
+        next_token_logits = outputs['logits'][:, -1, :]
         next_token = jnp.argmax(next_token_logits, axis=-1)
         next_token = next_token[:, None]  # Add sequence dimension
-        # Add new token to results
         all_token_ids = jnp.concatenate([all_token_ids, next_token], axis=1)
-        
-        # Update EOS tracking
+        cache = cache['cache']
         if eos_token_id is not None:
-            has_reached_eos = has_reached_eos | (next_token[:, 0] == eos_token_id)
+            has_reached_eos |= (next_token[:, 0] == eos_token_id)
+        
+        cur_len += 1
     
     return all_token_ids

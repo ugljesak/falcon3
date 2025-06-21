@@ -5,7 +5,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import jax.numpy as jnp
 import torch
 from ..test_utils import compare_results
-from model.model_falcon3 import FlaxFalcon3ForCausalLMModule
+from model.model_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
 
 def main(
@@ -42,7 +42,7 @@ def main(
     attention_mask = jnp.array(attention_mask.numpy())
     position_ids = jnp.array(position_ids.numpy())
     flax_config = Falcon3Config(num_hidden_layers=2)
-    flax_model = FlaxFalcon3ForCausalLMModule(flax_config)
+    flax_model = FlaxFalcon3ForCausalLM(flax_config)
     flax_params = flax_model.init(
         jax.random.PRNGKey(0),
         input_ids=input_ids,
@@ -68,7 +68,7 @@ def main(
     
     def torch_to_jnp(tensor):
         """Convert a PyTorch tensor to a JAX array."""
-        return jnp.array(tensor.detach().numpy())
+        return jnp.array(tensor.detach().float().cpu().numpy())
 
     # Copy all parameters from torch model to flax model
     flax_params['params']['model']['embed_tokens']['embedding'] = torch_to_jnp(
@@ -120,11 +120,12 @@ def main(
     print("Torch outputs logits shape:", torch_outputs.logits.shape)
     print("Flax outputs logits shape:", flax_outputs['logits'].shape)
 
-    # Write logits to separate files
-    np.save("torch_logits.npy", torch_outputs.logits.detach().cpu().numpy())
-    np.save("flax_logits.npy", np.array(flax_outputs['logits']))
-
     compare_results(flax_outputs['logits'], jnp.array(torch_outputs.logits.detach().numpy()))
+    print("Torch logits dtype:", torch_outputs.logits.dtype)
+    print("Flax logits dtype:", flax_outputs['logits'].dtype)
+    print(f"PCC Score: {jnp.min(jnp.corrcoef(flax_outputs['logits'].flatten(), jnp.array(torch_outputs.logits.detach().numpy()).flatten()))}")
+
+
 if __name__ == "__main__":
     main()
 
