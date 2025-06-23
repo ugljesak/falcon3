@@ -18,7 +18,7 @@ def torch_to_jnp(tensor):
 
     return tensor
 
-def make_model(config, torch_model, batch_size, seq_len, input_ids, attention_mask):
+def make_model(config, torch_model, batch_size, seq_len):
     """
     Convert a Hugging Face Falcon model to a JAX Falcon model.
     """
@@ -28,15 +28,13 @@ def make_model(config, torch_model, batch_size, seq_len, input_ids, attention_ma
     # Initialize dummy JAX model parameters
     # This is necessary to create the model structure
     # and to ensure that the parameters are in the correct format
-    # batch_size = 2
-    # seq_len = 50
-    # x_jax = jnp.array(np.random.randint(0, config.vocab_size, size=(batch_size, seq_len), dtype=np.int32))
-    # attention_mask_jax = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
+    
+    input_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
+    attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
     position_ids_jax = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
-    flax_params = flax_model.init(jax.random.PRNGKey(69), input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids_jax, init_cache=True, return_dict=True)
-
-    #print(params_jax['params']['transformer']['blocks_0'].keys())
-    #print(dir(torch_model.transformer.h[0]))
+    flax_init_jit = jax.jit(flax_model.init, static_argnames=('init_cache', 'return_dict'))
+    flax_params = flax_init_jit(jax.random.PRNGKey(69), input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids_jax, init_cache=True, return_dict=True)
+    
     # Copy weights from torch to jax
     flax_params['params']['model']['embed_tokens']['embedding'] = torch_to_jnp(
         torch_model.model.embed_tokens.weight
@@ -76,4 +74,4 @@ def make_model(config, torch_model, batch_size, seq_len, input_ids, attention_ma
         torch_model.lm_head.weight.T
     )
 
-    return flax_model, flax_params, flax_params['cache']
+    return flax_model, flax_params

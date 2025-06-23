@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from model.model_falcon import FalconForCausalLM
 from model.configuration_falcon import FalconConfig
 from model.convert_hf_weights import make_model
-from model.generate_model import generate
+from model.generate_model import generate, jit_generate
 from model.convert_hf_weights import torch_to_jnp
 
 def init_torch_model(model_name: str, config):
@@ -16,26 +16,22 @@ def init_torch_model(model_name: str, config):
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=config,
-        device_map="auto",
+        device_map="cpu",
         torch_dtype=torch.float32,
     )
     return torch_model
 
-def init_flax_model(config, torch_model, batch_size, seq_len, input_ids, attention_mask):
+def init_flax_model(config, torch_model, batch_size, max_len):
     """
     Initialize the Flax model from the PyTorch model.
     """
-    input_ids = torch_to_jnp(input_ids)
-    attention_mask = torch_to_jnp(attention_mask)
-    flax_model, flax_params, past_key_values = make_model(
+    flax_model, flax_params = make_model(
         config=config,
         torch_model=torch_model,
         batch_size=batch_size,
-        seq_len=seq_len,
-        input_ids=input_ids,
-        attention_mask=attention_mask
+        seq_len=max_len
     )
-    return flax_model, flax_params, input_ids, attention_mask, past_key_values
+    return flax_model, flax_params
 
 def prepare_torch_input(model_name, prompt):
     """
@@ -50,12 +46,14 @@ def prepare_flax_input(flax_model, input_ids, attention_mask, max_len):
     """
     Prepare input for the Flax model.
     """
+    input_ids = torch_to_jnp(input_ids)
+    attention_mask = torch_to_jnp(attention_mask)
     inputs = flax_model.prepare_inputs_for_generation(
         input_ids=input_ids,
         attention_mask=attention_mask,
         max_length=max_len,
     )
-    return inputs['attention_mask'], inputs['position_ids'], inputs['past_key_values']
+    return input_ids, inputs['attention_mask'], inputs['position_ids']
 
 def run_torch_model(torch_model, input_ids, attention_mask):
     """
@@ -72,19 +70,18 @@ def run_torch_model(torch_model, input_ids, attention_mask):
     )
     return outputs
 
-def run_flax_model(flax_params, flax_model, input_ids, attention_mask, position_ids, past_key_values, max_len):
+def run_flax_model(flax_params, flax_model, input_ids, attention_mask, position_ids, max_len):
     """
     Run the Flax model with the given input IDs and attention mask.
     """
     print("✍️ Generating Flax Model output...")
     _, seq_len = input_ids.shape
-    generated_ids = generate(
+    generated_ids = jit_generate(
         params=flax_params,
         model=flax_model,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_values=past_key_values,
         max_new_tokens=max_len - seq_len,
     )
     return generated_ids
@@ -122,24 +119,18 @@ def run_test(model_name: str, prompt: str):
     config._attn_implementation = "eager"
     config.dtype = torch.float32
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)
-    batch_size, seq_len = input_ids.shape
 
     torch_model = init_torch_model(model_name, config)
     torch_output = run_torch_model(torch_model, input_ids, attention_mask)
-    # breakpoint()  # For debugging purposes, you can remove this line later
-    if isinstance(torch_output, dict):
-        max_len = torch_output['sequences'][0].shape[0]
-    else:
-        max_len = torch_output.shape[1]
-    flax_model, flax_params, input_ids, attention_mask, past_key_values = init_flax_model(
+    max_len = torch_output.shape[1]
+    
+    flax_model, flax_params = init_flax_model(
         config=config,
         torch_model=torch_model,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        input_ids=input_ids,
-        attention_mask=attention_mask
+        batch_size=input_ids.shape[0],
+        max_len=max_len,
     )
-    attention_mask, position_ids, past_key_values = prepare_flax_input(
+    input_ids, attention_mask, position_ids = prepare_flax_input(
         flax_model=flax_model,
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -153,7 +144,6 @@ def run_test(model_name: str, prompt: str):
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_values=past_key_values,
         max_len=max_len,
     )
 

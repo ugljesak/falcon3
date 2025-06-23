@@ -403,31 +403,9 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
         )
 
-    def init_cache(self, batch_size, max_length):
-        r"""
-        Args:
-            batch_size (`int`):
-                batch_size used for fast auto-regressive decoding. Defines the batch size of the initialized cache.
-            max_length (`int`):
-                maximum possible length for auto-regressive decoding. Defines the sequence length of the initialized
-                cache.
-        """
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-
-        init_variables = self.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
-        )
-        return unfreeze(init_variables["cache"])
-
-
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         batch_size, seq_length = input_ids.shape
 
-        # initializing the cache
-        past_key_values = self.init_cache(batch_size, max_length)
-        
         # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
         # But since Falcon3 uses a causal mask, those positions are masked anyways.
         # Thus we can create a single static attention_mask here, which is more efficient for compilation
@@ -439,15 +417,10 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
 
         return {
-            "past_key_values": past_key_values,
             "attention_mask": extended_attention_mask,
             "position_ids": position_ids,
         }
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs['past_key_values']
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs
 
     def __call__(
         self,
@@ -484,3 +457,9 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             'hidden_states': outputs['hidden_states'],
             'attentions': outputs['attentions']
         }
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
