@@ -21,7 +21,7 @@ def init_torch_model(model_name: str, config):
     )
     return torch_model
 
-def init_flax_model(config, torch_model, batch_size, max_len):
+def init_flax_model(config, torch_model, batch_size, max_len, rule):
     """
     Initialize the Flax model from the PyTorch model.
     """
@@ -29,7 +29,8 @@ def init_flax_model(config, torch_model, batch_size, max_len):
         config=config,
         torch_model=torch_model,
         batch_size=batch_size,
-        seq_len=max_len
+        seq_len=max_len,
+        rule=rule
     )
     return flax_model, flax_params
 
@@ -117,7 +118,6 @@ def run_test(model_name: str, prompt: str):
         torch_dtype=torch.float32,
     )
     config._attn_implementation = "eager"
-    config.dtype = torch.float32
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)
 
     torch_model = init_torch_model(model_name, config)
@@ -129,6 +129,7 @@ def run_test(model_name: str, prompt: str):
         torch_model=torch_model,
         batch_size=input_ids.shape[0],
         max_len=max_len,
+        rule="hf"
     )
     input_ids, attention_mask, position_ids = prepare_flax_input(
         flax_model=flax_model,
