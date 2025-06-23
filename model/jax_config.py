@@ -7,56 +7,15 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from model.model_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
-
+import os
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 def create_device_mesh(dp_size, tp_size):
     """Create a 2D device mesh for tensor and data parallelism."""
     devices = np.array(jax.devices()).reshape(dp_size, tp_size)
     return Mesh(devices, ('dp', 'tp'))
 
 
-def get_sharding_annotations(config):
-    """Create sharding annotations for model parameters."""
 
-    partitioning_rules = {
-        'params': {
-            'model': {
-                'embed_tokens': {'embedding': P('tp', None)}, 
-                'norm': {'weight': P()}, 
-                'layers': {
-                    f'{layer}': {
-                        'input_layernorm': {'weight': P()},
-                        'self_attn': {
-                            'q_proj': {'kernel': P(None, 'tp')}, 
-                            'k_proj': {'kernel': P(None, 'tp')}, 
-                            'v_proj': {'kernel': P(None, 'tp')}, 
-                            'o_proj': {'kernel': P('tp', None)}, 
-                        }, 
-                        'post_attention_layernorm': {'weight': P()},
-                        'mlp': {
-                            'up_proj': {'kernel': P(None, 'tp')}, 
-                            'gate_proj': {'kernel': P(None, 'tp')}, 
-                            'down_proj': {'kernel': P('tp', None)}, 
-                        }, 
-                    }
-                for layer in range(config.num_hidden_layers)}, 
-            }, 
-            'lm_head': {'kernel': P(None, 'tp')},
-        },
-        'cache': {
-            'model': {
-                'layers': {
-                    f'{layer}': {
-                        'self_attn': {
-                            'cached_key': P(),
-                            'cached_value': P(),
-                            'cache_index': P(), 
-                        }
-                    }
-                for layer in range(config.num_hidden_layers)}, 
-            }
-        }
-    }
-    return partitioning_rules
 
 def init_sharded_model(config, rng, mesh):
     """Initialize the model with proper sharding."""
@@ -88,7 +47,7 @@ def init_sharded_model(config, rng, mesh):
         )(rng, input_ids, attention_mask, position_ids)
         
         # Get sharding rules
-        rules = get_sharding_annotations(model)
+        #rules = get_sharding_annotations(model)
         
         # Apply sharding rules to parameters
         flat_params = flatten_dict(params)

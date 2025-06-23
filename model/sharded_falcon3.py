@@ -13,6 +13,7 @@ from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.sharding import PartitionSpec as P
 from jax import lax
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
@@ -421,6 +422,48 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             "position_ids": position_ids,
         }
 
+    def get_sharding_annotations(self):
+    
+        partitioning_rules = {
+            'params': {
+                'model': {
+                    'embed_tokens': {'embedding': P('tp', None)}, 
+                    'norm': {'weight': P()}, 
+                    'layers': {
+                        f'{layer}': {
+                            'input_layernorm': {'weight': P()},
+                            'self_attn': {
+                                'q_proj': {'kernel': P(None, 'tp')}, 
+                                'k_proj': {'kernel': P(None, 'tp')}, 
+                                'v_proj': {'kernel': P(None, 'tp')}, 
+                                'o_proj': {'kernel': P('tp', None)}, 
+                            }, 
+                            'post_attention_layernorm': {'weight': P()},
+                            'mlp': {
+                                'up_proj': {'kernel': P(None, 'tp')}, 
+                                'gate_proj': {'kernel': P(None, 'tp')}, 
+                                'down_proj': {'kernel': P('tp', None)}, 
+                            }, 
+                        }
+                    for layer in range(self.config.num_hidden_layers)}, 
+                }, 
+                'lm_head': {'kernel': P(None, 'tp')},
+            },
+            'cache': {
+                'model': {
+                    'layers': {
+                        f'{layer}': {
+                            'self_attn': {
+                                'cached_key': P(),
+                                'cached_value': P(),
+                                'cache_index': P(), 
+                            }
+                        }
+                    for layer in range(self.config.num_hidden_layers)}, 
+                }
+            }
+        }
+        return partitioning_rules
 
     def __call__(
         self,

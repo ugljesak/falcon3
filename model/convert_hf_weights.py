@@ -152,8 +152,7 @@ def make_model(config, torch_model, batch_size, seq_len, rule):
     if(rule == 'torch'):
         flax_model, flax_params = convert_from_torch_model(torch_model, flax_model, batch_size, seq_len, config)
     elif(rule == 'hf'):
-        #path = 'C:\Users\kuzma\.cache\huggingface\hub\models--tiiuae--Falcon3-7B-Instruct\snapshots\1e57a0ecd176c7c139f289c60a74e57f887c3dfb'
-        path = '.\hf_weights'
+        path = '../.cache/huggingface/hub/models--tiiuae--Falcon3-7B-Instruct/snapshots/1e57a0ecd176c7c139f289c60a74e57f887c3dfb/'
         flax_params = convert_from_hf_weights(path, batch_size, seq_len, config)
     else:
         raise ValueError(f"Unknown conversion rule: {rule}. Use 'torch' or 'hf'.")
