@@ -422,7 +422,7 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             "position_ids": position_ids,
         }
 
-    def get_sharding_annotations(self):
+    def get_partitioning_rules(self):
     
         partitioning_rules = {
             'params': {
@@ -506,3 +506,73 @@ class FlaxFalcon3ForCausalLM(nn.Module):
 
     def __eq__(self, other):
         return self is other
+    
+    def generate(
+        self,
+        params: dict = None,
+        input_ids: jax.Array = None,
+        attention_mask: jax.Array = None,
+        position_ids: jax.Array = None,
+        max_new_tokens = 20,
+        pad_token_id = None,
+        eos_token_id = None,
+    ):
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.e
+        # Initialize generation variables
+        batch_size, seq_length = input_ids.shape
+
+        rules = self.get_partitioning_rules()
+
+        sharded_model = nn.with_partitioning(self, rules)
+
+        def model_pass(input_ids, attention_mask, position_ids, past_key_values):
+            outputs = sharded_model(
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values,
+            )
+            outputs = outputs.raw_value
+            return outputs.logits, outputs.past_key_values
+
+        outputs, cache = self.apply(
+            params,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids[:, :seq_length],
+            return_dict=True,
+            #init_cache=True,
+            mutable=['cache'],
+        )
+    
+        # Get cache, logits and predict next token
+        next_token_logits = outputs['logits'][:, -1, :]
+        next_token = jnp.argmax(next_token_logits, axis=-1)
+        next_token = next_token[:, None]  # Add sequence dimension
+        all_token_ids = jnp.concatenate([input_ids, next_token], axis=1)
+        params['cache'] = cache['cache']
+        
+        print(f"Auto-regressive generation to predict next tokens...")
+        # Start auto-regressive generation loop
+        for i in range(1, max_new_tokens):
+            print("------", i, "------") #just to track tokens
+            
+            outputs, cache = self.apply(
+                params,
+                input_ids=next_token,  # Only process the new token
+                attention_mask=attention_mask,
+                position_ids = position_ids[:, seq_length].reshape(-1, 1),
+                return_dict=True,
+                mutable=['cache'],
+            )
+            # Get cache, logits and predict next token
+            next_token_logits = outputs['logits'][:, -1, :]
+            next_token = jnp.argmax(next_token_logits, axis=-1)
+            next_token = next_token[:, None]  # Add sequence dimension
+            all_token_ids = jnp.concatenate([all_token_ids, next_token], axis=1)
+            params['cache'] = cache['cache']
+
+            seq_length += 1
+        
+        return all_token_ids

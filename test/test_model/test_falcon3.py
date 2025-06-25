@@ -1,11 +1,10 @@
-import os
-os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 import jax
+import jax.experimental
+import jax.experimental.shard_map
 import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 from jax.sharding import NamedSharding
-from jax.experimental.shard_map import shard_map
 import numpy as np
 from transformers import AutoTokenizer
 from transformers import AutoConfig
@@ -49,7 +48,7 @@ def main():
     position_ids = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
     position_ids = jax.lax.with_sharding_constraint(position_ids, NamedSharding(device_mesh, P('dp', None)))
     jax.debug.visualize_array_sharding(input_ids)
-    sharded_apply = shard_map(
+    sharded_apply = jax.experimental.shard_map.shard_map(
             apply,
             mesh = device_mesh,
             in_specs = (P(), P(), P(), P()), 
