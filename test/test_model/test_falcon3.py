@@ -8,10 +8,10 @@ from jax.sharding import NamedSharding
 import numpy as np
 from transformers import AutoTokenizer
 from transformers import AutoConfig
-from model.model_falcon3 import FlaxFalcon3ForCausalLM
+from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
 from model.convert_hf_weights import make_model
-from model.jax_config import create_device_mesh, get_sharding_annotations
+from model.jax_config import *
 
 def main():
     config = AutoConfig.from_pretrained("tiiuae/Falcon3-7B-Instruct",
@@ -30,17 +30,9 @@ def main():
     )
     device_mesh = create_device_mesh(dp_size=2, tp_size=4)
     print("Device mesh:", device_mesh)
+    rules = model.get_partitioning_rules()
+    flax_params = shard_params(flax_params, rules, device_mesh)
 
-    def apply(flax_params, input_ids, attention_mask, position_ids):
-        outputs = model.apply(
-            flax_params,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            return_dict=True,
-            mutable=['cache'],
-        )
-        return outputs
     input_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
     input_ids = jax.lax.with_sharding_constraint(input_ids, NamedSharding(device_mesh, P('dp', None)))
     attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
@@ -48,22 +40,15 @@ def main():
     position_ids = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
     position_ids = jax.lax.with_sharding_constraint(position_ids, NamedSharding(device_mesh, P('dp', None)))
     jax.debug.visualize_array_sharding(input_ids)
-    sharded_apply = jax.experimental.shard_map.shard_map(
-            apply,
-            mesh = device_mesh,
-            in_specs = (P(), P(), P(), P()), 
-            out_specs = (P(), P()),          
-            check_rep = False
-        )
-    outputs = jax.jit(apply)(
+    outputs = model.generate(
         flax_params,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
+        max_new_tokens=20,
+        pad_token_id=11,  # Default pad token ID
+        eos_token_id=11,  # Default end of sequence token ID
     )
-    next_token_logits = outputs[0]['logits'][:, -1, :]
-    sorted_logits = jnp.sort(next_token_logits, axis=-1)
-    print("Next token logits:", sorted_logits[:, -5:])
 
 
 if __name__ == "__main__":

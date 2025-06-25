@@ -525,17 +525,7 @@ class FlaxFalcon3ForCausalLM(nn.Module):
         rules = self.get_partitioning_rules()
 
         sharded_model = nn.with_partitioning(self, rules)
-
-        def model_pass(input_ids, attention_mask, position_ids, past_key_values):
-            outputs = sharded_model(
-                input_ids,
-                attention_mask,
-                position_ids,
-                past_key_values,
-            )
-            outputs = outputs.raw_value
-            return outputs.logits, outputs.past_key_values
-
+        breakpoint()  # Debugging point to inspect sharded_model
         outputs, cache = self.apply(
             params,
             input_ids=input_ids,

@@ -46,6 +46,10 @@ def convert_from_hf_weights(checkpoint_path, batch_size, seq_len, config):
         #breakpoint()  # Debugging point to inspect checkpoint
         ckpts.append(checkpoint)
 
+    def from_checkpoint(key, axis=0):
+        weights = jnp.concatenate([torch_to_jnp(ckpt[key]) for ckpt in ckpts if key in ckpt], axis=axis) 
+        return weights
+
     print(f"Loaded {len(ckpts)} checkpoints from {checkpoint_path}")
     flax_params = {
         'params': {
@@ -54,23 +58,23 @@ def convert_from_hf_weights(checkpoint_path, batch_size, seq_len, config):
                 'norm': {'weight': torch_to_jnp(ckpts[2]['model.norm.weight'])}, 
                 'layers': {
                     f'{layer}': {
-                        'input_layernorm': {'weight': torch_to_jnp(ckpts[0]['model.layers.%d.input_layernorm.weight' % (layer)])},
+                        'input_layernorm': {'weight': torch_to_jnp(ckpts[0][f'model.layers.{layer}.input_layernorm.weight'])},
                         'self_attn': {
-                            'q_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.self_attn.q_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.self_attn.q_proj.weight' % (layer) in ckpt], axis=0).transpose()}, 
-                            'k_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.self_attn.k_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.self_attn.k_proj.weight' % (layer) in ckpt], axis=0).transpose()}, 
-                            'v_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.self_attn.v_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.self_attn.v_proj.weight' % (layer) in ckpt], axis=0).transpose()}, 
-                            'o_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.self_attn.o_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.self_attn.o_proj.weight' % (layer) in ckpt], axis=1).transpose()}, 
+                            'q_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.q_proj.weight', axis=0).transpose()}, 
+                            'k_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.k_proj.weight', axis=0).transpose()},
+                            'v_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.v_proj.weight', axis=0).transpose()},
+                            'o_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.o_proj.weight', axis=1).transpose()}, 
                         }, 
-                        'post_attention_layernorm': {'weight': torch_to_jnp(ckpts[0]['model.layers.%d.post_attention_layernorm.weight' % (layer)])},
+                        'post_attention_layernorm': {'weight': torch_to_jnp(ckpts[0][f'model.layers.{layer}.post_attention_layernorm.weight'])},
                         'mlp': {
-                            'up_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.mlp.up_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.mlp.up_proj.weight' % (layer) in ckpt], axis=0).transpose()}, 
-                            'gate_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.mlp.gate_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.mlp.gate_proj.weight' % (layer) in ckpt], axis=0).transpose()}, 
-                            'down_proj': {'kernel': jnp.concatenate([torch_to_jnp(ckpt['model.layers.%d.mlp.down_proj.weight' % (layer)]) for ckpt in ckpts if 'model.layers.%d.mlp.down_proj.weight' % (layer) in ckpt], axis=1).transpose()}, 
+                            'up_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.up_proj.weight', axis=0).transpose()}, 
+                            'gate_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.gate_proj.weight', axis=0).transpose()},
+                            'down_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.down_proj.weight', axis=1).transpose()},
                         }, 
                     }
                 for layer in range(config.num_hidden_layers)}, 
             }, 
-            'lm_head': {'kernel': torch_to_jnp(ckpts[-1]['lm_head.weight']).transpose()}, 
+            'lm_head': {'kernel': torch_to_jnp(ckpts[3]['lm_head.weight']).transpose()}, 
         },
         'cache': {
             'model': {
@@ -87,9 +91,6 @@ def convert_from_hf_weights(checkpoint_path, batch_size, seq_len, config):
         }
     }
     del ckpts
-    torch.cuda.empty_cache()
-    import gc; gc.collect()
-
     return flax_params
 
 def convert_from_torch_model(torch_model, flax_model, batch_size, seq_len, config):

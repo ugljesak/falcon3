@@ -23,3 +23,24 @@ def with_named_sharding_constraint(x, mesh, partition_spec):
     else:
         print("No mesh defined, skipping sharding constraint.")
         return x
+    
+def shard_params(params, rules, device_mesh):
+    """Apply sharding to loaded parameters based on partitioning rules."""
+    params = flatten_dict(params)
+    rules = flatten_dict(rules)
+    
+    sharded_params = {}
+
+    for param_key, param_value in params.items():
+        # Find the corresponding rule
+        rule_key = param_key  # Adjust if your rules have different structure
+        if rule_key in rules:
+            partition_spec = rules[rule_key]
+            
+            sharding = NamedSharding(device_mesh, partition_spec)
+            sharded_param = jax.device_put(param_value, sharding)
+            sharded_params[param_key] = sharded_param
+        else:
+            sharded_params[param_key] = param_value
+    
+    return unflatten_dict(sharded_params)
