@@ -3,8 +3,6 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from model.model_falcon import FalconForCausalLM
-from model.configuration_falcon import FalconConfig
 from model.convert_hf_weights import make_model
 from model.generate_model import generate, jit_generate
 from model.convert_hf_weights import torch_to_jnp
@@ -117,7 +115,8 @@ def run_test(model_name: str, prompt: str):
         num_hidden_layers=2,
         torch_dtype=torch.float32,
     )
-    config._attn_implementation = "eager"
+    breakpoint()  # Debugging point to inspect config
+    # config._attn_implementation = "eager"
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)
 
     torch_model = init_torch_model(model_name, config)

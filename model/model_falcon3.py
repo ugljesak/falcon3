@@ -9,16 +9,31 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
-
 from model.configuration_falcon3 import Falcon3Config
-from transformers.models.llama.configuration_llama import LlamaConfig
 
+def debug(tensor, name):
+    """Enhanced debugging function to print sharding information."""
+    print(f"\n=== Debugging {name} ===")
+    print(f"Shape: {tensor.shape}")
+    print(f"Dtype: {tensor.dtype}")
+    
+    # Show sharding information
+    if hasattr(tensor, 'sharding'):
+        print(f"Sharding: {tensor.sharding}")
+        print(f"Is fully replicated: {tensor.is_fully_replicated}")
+    
+    # Visualize array sharding
+    try:
+        jax.debug.visualize_array_sharding(tensor)
+    except Exception as e:
+        print(f"Could not visualize sharding: {e}")
+    
+    # Show which devices the array is on
+    print(f"Devices: {[d for d in tensor.devices()]}")
+    print("=" * 50)
 
 def create_sinusoidal_positions(num_pos, theta, dim):
     inv_freq = 1.0 / (theta ** (np.arange(0, dim, 2) / dim))
@@ -55,7 +70,7 @@ class FlaxFalcon3RMSNorm(nn.Module):
         variance = variance.mean(-1, keepdims=True)
         # use `jax.numpy.sqrt` as `jax.lax.rsqrt` does not match `torch.rsqrt`
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-
+        debug(hidden_states, "hidden_states after RMSNorm")
         return self.weight * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
@@ -75,6 +90,8 @@ class FlaxFalcon3RotaryEmbedding(nn.Module):
 
         key = jnp.asarray(key, dtype=self.dtype)
         query = jnp.asarray(query, dtype=self.dtype)
+        debug(key, "key after rotary embedding")
+        debug(query, "query after rotary embedding")
 
         return key, query
 
@@ -162,7 +179,9 @@ class FlaxFalcon3Attention(nn.Module):
         query = self._split_heads(query, self.num_heads)
         key = self._split_heads(key, self.num_key_value_heads)
         value = self._split_heads(value, self.num_key_value_heads)
-        
+        debug(query, "query after splitting heads")
+        debug(key, "key after splitting heads")
+        debug(value, "value after splitting heads")
         key, query = self.rotary_emb(key, query, position_ids)
         query_length, key_length = query.shape[1], key.shape[1]
 
@@ -215,11 +234,11 @@ class FlaxFalcon3Attention(nn.Module):
         )
         if self.attention_softmax_in_fp32:
             attn_weights = attn_weights.astype(self.dtype)
-
+        debug(attn_weights, "attention weights after dot product attention")
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
-        
+        debug(attn_output, "attention output after merging heads and output projection")
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
 
@@ -242,8 +261,10 @@ class FlaxFalcon3MLP(nn.Module):
     def __call__(self, hidden_states):
         up_proj_states = self.up_proj(hidden_states)
         gate_states = self.act(self.gate_proj(hidden_states))
-
+        debug(up_proj_states, "up projection states")
+        debug(gate_states, "gate states after activation")
         hidden_states = self.down_proj(up_proj_states * gate_states)
+        debug(hidden_states, "hidden states after down projection")
         return hidden_states
 
 
@@ -362,6 +383,7 @@ class FlaxFalcon3Model(nn.Module):
         return_dict: bool = True,
     ):
         input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        debug(input_embeds, "input embeddings after embedding layer")
         outputs = self.layers(
             input_embeds,
             position_ids=position_ids,
@@ -391,7 +413,7 @@ class FlaxFalcon3Model(nn.Module):
         }
     
 class FlaxFalcon3ForCausalLM(nn.Module):
-    config: LlamaConfig
+    config: Falcon3Config
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -449,6 +471,7 @@ class FlaxFalcon3ForCausalLM(nn.Module):
         else:
             hidden_states = outputs['last_hidden_state']
         lm_logits = self.lm_head(hidden_states)
+        debug(lm_logits, "logits after language model head")
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 

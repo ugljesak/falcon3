@@ -1,5 +1,4 @@
 import os
-os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,9 +10,23 @@ from jax.sharding import NamedSharding
 from model.model_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
 
+global DEVICE_COUNT
+DEVICE_COUNT = None  # Set the number of devices for parallelism
+def set_device_count(count):
+    """Set the global device count for JAX."""
+    global DEVICE_COUNT
+    DEVICE_COUNT = count
+    os.environ["XLA_FLAGS"] = f'--xla_force_host_platform_device_count={DEVICE_COUNT}'
+    jax.config.update("jax_platform_name", "cpu")  # Ensure JAX uses CPU for testing
 
 def create_device_mesh(dp_size, tp_size):
     """Create a 2D device mesh for tensor and data parallelism."""
+    if DEVICE_COUNT is None:
+        set_device_count(dp_size * tp_size)
+    if dp_size * tp_size != DEVICE_COUNT:
+        print(f"Warning: Device count mismatch! Expected {DEVICE_COUNT}, got {dp_size * tp_size}.")
+        print("Setting device count to dp_size * tp_size.")
+        set_device_count(dp_size * tp_size)
     devices = np.array(jax.devices()).reshape(dp_size, tp_size)
     return Mesh(devices, ('dp', 'tp'))
 
@@ -24,6 +37,49 @@ def with_named_sharding_constraint(x, mesh, partition_spec):
         print("No mesh defined, skipping sharding constraint.")
         return x
     
+def get_partitioning_rules(config: Falcon3Config = None):
+    
+    partitioning_rules = {
+        'params': {
+            'model': {
+                'embed_tokens': {'embedding': P('tp', None)}, 
+                'norm': {'weight': P()}, 
+                'layers': {
+                    f'{layer}': {
+                        'input_layernorm': {'weight': P()},
+                        'self_attn': {
+                            'q_proj': {'kernel': P(None, 'tp')}, 
+                            'k_proj': {'kernel': P(None, 'tp')}, 
+                            'v_proj': {'kernel': P(None, 'tp')}, 
+                            'o_proj': {'kernel': P('tp', None)}, 
+                        }, 
+                        'post_attention_layernorm': {'weight': P()},
+                        'mlp': {
+                            'up_proj': {'kernel': P(None, 'tp')}, 
+                            'gate_proj': {'kernel': P(None, 'tp')}, 
+                            'down_proj': {'kernel': P('tp', None)}, 
+                        }, 
+                    }
+                for layer in range(config.num_hidden_layers)}, 
+            }, 
+            'lm_head': {'kernel': P(None, 'tp')},
+        },
+        'cache': {
+            'model': {
+                'layers': {
+                    f'{layer}': {
+                        'self_attn': {
+                            'cached_key': P(),
+                            'cached_value': P(),
+                            'cache_index': P(), 
+                        }
+                    }
+                for layer in range(config.num_hidden_layers)}, 
+            }
+        }
+    }
+    return partitioning_rules
+
 def shard_params(params, rules, device_mesh):
     """Apply sharding to loaded parameters based on partitioning rules."""
     params = flatten_dict(params)

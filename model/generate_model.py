@@ -2,12 +2,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from .model_falcon import FalconForCausalLM
+from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 from test.test_utils import compare_results
 from model.convert_hf_weights import torch_to_jnp
 
 def generate(
-    model: FalconForCausalLM = None,
+    model: FlaxFalcon3ForCausalLM = None,
     params: dict = None,
     input_ids: jax.Array = None,
     attention_mask: jax.Array = None,

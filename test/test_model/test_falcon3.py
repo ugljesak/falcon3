@@ -12,25 +12,32 @@ from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
 from model.convert_hf_weights import make_model
 from model.jax_config import *
+from model.generate_model import generate, jit_generate
 
 def main():
     config = AutoConfig.from_pretrained("tiiuae/Falcon3-7B-Instruct",
         num_hidden_layers=2,
     )
     model = FlaxFalcon3ForCausalLM(config)
-
     batch_size = 2
     seq_len = 12
-    flax_model, flax_params = make_model(
+    single_model, flax_params = make_model(
         config=config,
         torch_model=None,
         batch_size=batch_size,
         seq_len=seq_len,
         rule='hf'
     )
+    singe_outputs = jit_generate(
+        single_model,
+        flax_params,
+        input_ids=jnp.zeros((batch_size, seq_len), dtype=jnp.int32),
+        attention_mask=jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+        position_ids=jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
+    )
     device_mesh = create_device_mesh(dp_size=2, tp_size=4)
     print("Device mesh:", device_mesh)
-    rules = model.get_partitioning_rules()
+    rules = get_partitioning_rules(config)
     flax_params = shard_params(flax_params, rules, device_mesh)
 
     input_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
@@ -40,7 +47,8 @@ def main():
     position_ids = jnp.arange(seq_len)[None, :].repeat(batch_size, axis=0)
     position_ids = jax.lax.with_sharding_constraint(position_ids, NamedSharding(device_mesh, P('dp', None)))
     jax.debug.visualize_array_sharding(input_ids)
-    outputs = model.generate(
+    multi_outputs = jit_generate(
+        model,
         flax_params,
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -49,6 +57,9 @@ def main():
         pad_token_id=11,  # Default pad token ID
         eos_token_id=11,  # Default end of sequence token ID
     )
+    breakpoint()  # Debugging point to inspect multi_outputs
+    print("Single model outputs:", singe_outputs)
+    print("Multi model outputs:", multi_outputs)
 
 
 if __name__ == "__main__":

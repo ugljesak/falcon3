@@ -10,7 +10,6 @@ from .model_falcon3 import FlaxFalcon3ForCausalLM
 from .configuration_falcon import FalconConfig
 from transformers.models.falcon.modeling_falcon import FalconForCausalLM as TorchFalconForCausalLM
 from safetensors.torch import load_file as safe_load_file
-from model.jax_config import get_sharding_annotations
 
 def torch_to_jnp(tensor):
     # Special handling for bfloat16 tensors
