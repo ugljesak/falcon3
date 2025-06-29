@@ -4,9 +4,12 @@
 from functools import partial
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+import json
+from pathlib import Path
 
 import flax.linen as nn
 import jax
+from jax import lax
 import jax.numpy as jnp
 import numpy as np
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -14,11 +17,11 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import PartitionSpec as P
-from jax import lax
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from jax.sharding import Mesh, NamedSharding
 
 from model.configuration_falcon3 import Falcon3Config
 from transformers.models.llama.configuration_llama import LlamaConfig
+from safetensors.flax import load_file
 
 
 def create_sinusoidal_positions(num_pos, theta, dim):
@@ -122,24 +125,24 @@ class FlaxFalcon3Attention(nn.Module):
         states from previous steps. This function is slightly adapted from the official Flax repository:
         https://github.com/google/flax/blob/491ce18759622506588784b4fca0e4bf05f8c8cd/flax/linen/attention.py#L252
         """
-        # detect if we're initializing by absence of existing cache data.
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
         cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
 
         if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            # update key, value caches with our new 1d spatial slices
+            *batch_dims, max_length, _, _ = cached_key.value.shape
+            
             cur_index = cache_index.value
             indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
             key = lax.dynamic_update_slice(cached_key.value, key, indices)
             value = lax.dynamic_update_slice(cached_value.value, value, indices)
+            
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
-            # causal mask for cached decoder self-attention: our single query position should only attend to those key positions that have already been generated and cached, not the remaining zero elements.
+            
             pad_mask = jnp.broadcast_to(
                 jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
                 tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
@@ -149,13 +152,14 @@ class FlaxFalcon3Attention(nn.Module):
 
     def __call__(
         self,
-        hidden_states,
-        attention_mask,
-        position_ids,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array,
+        position_ids: jax.Array,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-    ):
+    ) -> Tuple[jax.Array, ...]:
+        
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
@@ -201,10 +205,9 @@ class FlaxFalcon3Attention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
-
-        # usual dot product attention
         attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
         
+        # compute attention weights using dot product attention
         attn_weights = dot_product_attention_weights(
             query,
             key,
@@ -240,7 +243,8 @@ class FlaxFalcon3MLP(nn.Module):
         self.down_proj = nn.Dense(embed_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
         self.up_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        
         up_proj_states = self.up_proj(hidden_states)
         gate_states = self.act(self.gate_proj(hidden_states))
 
@@ -260,13 +264,13 @@ class FlaxFalcon3DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array,
+        position_ids: jax.Array,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-    ):
+    ) -> Tuple[jax.Array, ...]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         outputs = self.self_attn(
@@ -300,15 +304,15 @@ class FlaxFalcon3LayerCollection(nn.Module):
 
     def __call__(
         self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
+        hidden_states: jax.Array,
+        attention_mask: jax.Array,
+        position_ids: jax.Array,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        return_dict: bool = False,
-    ):
+    ) -> Tuple[jax.Array, ...]:
+        
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
@@ -329,7 +333,7 @@ class FlaxFalcon3LayerCollection(nn.Module):
             if output_attentions:
                 all_attentions += (layer_outputs[1],)
 
-        # this contains possible `None` values - `FlaxFalcon3Module` will filter them out
+        # this can hold None values, but `FlaxFalcon3Model` will filter them out
         outputs = (hidden_states, all_hidden_states, all_attentions)
 
         return outputs
@@ -353,15 +357,17 @@ class FlaxFalcon3Model(nn.Module):
 
     def __call__(
         self,
-        input_ids,
-        attention_mask=None,
-        position_ids=None,
-        deterministic=True,
+        input_ids: jax.Array = None,
+        attention_mask: jax.Array = None,
+        position_ids: jax.Array = None,
+        deterministic: bool = True,
         init_cache: bool = False,
+        logits_to_keep: Union[int, jax.Array] = 0,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ):
+    ) -> Union[Tuple[jax.Array, ...], dict]:
+        
         input_embeds = self.embed_tokens(input_ids.astype("i4"))
         outputs = self.layers(
             input_embeds,
@@ -375,7 +381,10 @@ class FlaxFalcon3Model(nn.Module):
         )
 
         hidden_states = outputs[0]
-        hidden_states = self.norm(hidden_states)
+        
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        hidden_states = self.norm(hidden_states[:, slice_indices, :])
+        
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
             outputs = (hidden_states, all_hidden_states) + outputs[2:]
@@ -384,14 +393,14 @@ class FlaxFalcon3Model(nn.Module):
 
         if not return_dict:
             return tuple(v for v in outputs if v is not None)
-
-        return {
-            'last_hidden_state': hidden_states,
-            'hidden_states': outputs[1],
-            'attentions': outputs[-1],
-        }
+        else:
+            return {
+                'last_hidden_state': hidden_states,
+                'hidden_states': outputs[1],
+                'attentions': outputs[-1],
+            }
     
-class FlaxFalcon3ForCausalLM(nn.Module):
+class FlaxFalcon3ForCausalLMModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
@@ -402,39 +411,35 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-        )
-
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
-        batch_size, seq_length = input_ids.shape
-
-        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
-        # But since Falcon3 uses a causal mask, those positions are masked anyways.
-        # Thus we can create a single static attention_mask here, which is more efficient for compilation
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-        if attention_mask is not None:
-            position_ids = extended_attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
-        else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
-
-        return {
-            "attention_mask": extended_attention_mask,
-            "position_ids": position_ids,
-        }
-
-    
+        ) 
 
     def __call__(
         self,
-        input_ids,
-        attention_mask=None,
-        position_ids=None,
+        input_ids: jax.Array = None,
+        attention_mask: jax.Array = None,
+        position_ids: jax.Array = None,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ):
+    ) -> Union[Tuple[jax.Array, ...], dict]:
+        """
+        Forward pass for the Falcon3 model for causal language modeling.
+        
+        Args:    
+            input_ids (jax.Array): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (jax.Array): Attention mask of shape (batch_size, seq_len).
+            position_ids (jax.Array): Position IDs of shape (batch_size, seq_len).
+            deterministic (bool): Whether to use dropout or not.
+            init_cache (bool): Whether to initialize the cache for fast autoregressive decoding.
+            output_attentions (bool): Whether to return attention weights across the layers.
+            output_hidden_states (bool): Whether to return hidden states across the layers.
+            return_dict (bool): Whether to return a dictionary or a tuple.
+        Returns:
+            dict or tuple: If `return_dict` is True, returns a dictionary with keys 'logits', 'hidden_states', and 'attentions'.
+        """
+        
         outputs = self.model(
             input_ids,
             position_ids=position_ids,
@@ -450,19 +455,367 @@ class FlaxFalcon3ForCausalLM(nn.Module):
             hidden_states = outputs[0]
         else:
             hidden_states = outputs['last_hidden_state']
+        
         lm_logits = self.lm_head(hidden_states)
+        
         if not return_dict:
             return (lm_logits,) + outputs[1:]
+        else:
+            return {
+                'logits': lm_logits,
+                'hidden_states': outputs['hidden_states'],
+                'attentions': outputs['attentions']
+            }
 
-        return {
-            'logits': lm_logits,
-            'hidden_states': outputs['hidden_states'],
-            'attentions': outputs['attentions']
-        }
 
+class FlaxFalcon3ForCausalLM():
+    config_class = Falcon3Config
+    base_model_prefix = "falcon3"
+
+    def __init__(self, config: Falcon3Config, dtype: jnp.dtype = jnp.float32):
+        self.config = config
+        self.model = FlaxFalcon3ForCausalLMModule(config, dtype=dtype)
+        
     def __hash__(self):
         return id(self)
 
     def __eq__(self, other):
         return self is other
     
+    def init_weights(
+        self,
+        rng: Optional[Union[int, jax.random.PRNGKey]] = None,
+        input_ids: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
+        position_ids: Optional[jax.Array] = None,
+        init_cache: bool = True
+    ) -> FrozenDict:
+        
+        """
+        Initialize the model weights.
+        
+        Args:
+            rng (Optional[jax.random.PRNGKey]): Random key for initialization.
+            input_ids (Optional[jax.Array]): Input token IDs for the initialization of the model.
+            attention_mask (Optional[jax.Array]): Attention mask for the initialization of the model.
+            position_ids (Optional[jax.Array]): Position IDs for the initialization of the model.
+            init_cache (bool): Whether to initialize the cache in initializationfor fast autoregressive decoding.
+        Returns:
+            dict: Initialized model parameters.
+        """
+        if rng is None:
+            rng = jax.random.PRNGKey(42)
+        elif isinstance(rng, int):
+            rng = jax.random.PRNGKey(rng)
+        
+        input_ids = input_ids if input_ids is not None else jnp.zeros((2, 4), dtype=jnp.int32)
+        attention_mask = attention_mask if attention_mask is not None else jnp.ones((2, 4), dtype=jnp.int32)
+        position_ids = position_ids if position_ids is not None else jnp.arange(4, dtype=jnp.int32)[None, :].repeat(2, axis=0)
+
+        model_params = self.model.init(
+            rng,
+            input_ids,
+            attention_mask,
+            position_ids,
+            init_cache=init_cache
+        )
+
+        return model_params
+    
+    def _download_weights(self) -> Path:
+        
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(
+            repo_id="tiiuae/Falcon3-7B-Instruct",
+            local_dir="./hf_weights",
+        )
+
+        return Path(path)
+
+    def convert_from_hf_weights(
+        self,
+        config: Falcon3Config,
+        checkpoint_path: Union[str, Path],
+        batch_size: int,
+        seq_len: int,
+    ) -> FrozenDict:
+        """ 
+        Convert weights from a Hugging Face checkpoint to a Flax model.
+        
+        Args:
+            config (Falcon3Config): Configuration for the model.
+            batch_size (int): Batch size for the model.
+            checkpoint_path (str or Path): Path to the Hugging Face checkpoint directory.
+            max_len (int): Maximum sequence length for the model (including future auto-regressive generated tokens).
+        Returns:
+            FrozenDict: Flax parameters converted from the Hugging Face checkpoint.
+        """
+
+        if checkpoint_path is None:
+            checkpoint_path = self._download_weights()
+        elif isinstance(checkpoint_path, str):
+            checkpoint_path = Path(checkpoint_path)
+        
+        ckpt_paths = sorted(checkpoint_path.glob("*.safetensors"))
+        ckpts = []
+        test_params = {}
+        for ckpt_path in ckpt_paths:
+            checkpoint = load_file(str(ckpt_path))
+            ckpts.append(checkpoint)
+            test_params.update(checkpoint)
+        
+        def from_checkpoint(key, axis=0):
+            weights = jnp.concatenate([ckpt[key] for ckpt in ckpts if key in ckpt], axis=axis) 
+            return weights
+
+        breakpoint()
+
+        print(f"Loaded {len(ckpts)} checkpoints from {checkpoint_path}")
+        flax_params = {
+            'params': {
+                'model': {
+                    'embed_tokens': {'embedding': from_checkpoint('model.embed_tokens.weight')}, 
+                    'norm': {'weight': from_checkpoint('model.norm.weight')}, 
+                    'layers': {
+                        f'{layer}': {
+                            'input_layernorm': {'weight': from_checkpoint(f'model.layers.{layer}.input_layernorm.weight')},
+                            'self_attn': {
+                                'q_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.q_proj.weight', axis=0).transpose()}, 
+                                'k_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.k_proj.weight', axis=0).transpose()},
+                                'v_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.v_proj.weight', axis=0).transpose()},
+                                'o_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.self_attn.o_proj.weight', axis=1).transpose()}, 
+                            }, 
+                            'post_attention_layernorm': {'weight': from_checkpoint(f'model.layers.{layer}.post_attention_layernorm.weight')},
+                            'mlp': {
+                                'up_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.up_proj.weight', axis=0).transpose()}, 
+                                'gate_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.gate_proj.weight', axis=0).transpose()},
+                                'down_proj': {'kernel': from_checkpoint(f'model.layers.{layer}.mlp.down_proj.weight', axis=1).transpose()},
+                            }, 
+                        }
+                    for layer in range(config.num_hidden_layers)}, 
+                }, 
+                'lm_head': {'kernel': from_checkpoint('lm_head.weight').transpose()}, 
+            },
+            'cache': {
+                'model': {
+                    'layers': {
+                        f'{layer}': {
+                            'self_attn': {
+                                'cached_key': jnp.zeros((batch_size, seq_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
+                                'cached_value': jnp.zeros((batch_size, seq_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
+                                'cache_index': jnp.array(0, dtype=jnp.int32), 
+                            }
+                        }
+                    for layer in range(self.config.num_hidden_layers)}, 
+                }
+            }
+        }
+        del ckpts
+        return freeze(flax_params)
+
+    def get_partitioning_rules(self):
+    
+        partitioning_rules = {
+            'params': {
+                'model': {
+                    'embed_tokens': {'embedding': P('tp', None)}, 
+                    'norm': {'weight': P()}, 
+                    'layers': {
+                        f'{layer}': {
+                            'input_layernorm': {'weight': P()},
+                            'self_attn': {
+                                'q_proj': {'kernel': P(None, 'tp')}, 
+                                'k_proj': {'kernel': P(None, 'tp')}, 
+                                'v_proj': {'kernel': P(None, 'tp')}, 
+                                'o_proj': {'kernel': P('tp', None)}, 
+                            }, 
+                            'post_attention_layernorm': {'weight': P()},
+                            'mlp': {
+                                'up_proj': {'kernel': P(None, 'tp')}, 
+                                'gate_proj': {'kernel': P(None, 'tp')}, 
+                                'down_proj': {'kernel': P('tp', None)}, 
+                            }, 
+                        }
+                    for layer in range(self.config.num_hidden_layers)}, 
+                }, 
+                'lm_head': {'kernel': P(None, 'tp')},
+            },
+            'cache': {
+                'model': {
+                    'layers': {
+                        f'{layer}': {
+                            'self_attn': {
+                                'cached_key': P(),
+                                'cached_value': P(),
+                                'cache_index': P(), 
+                            }
+                        }
+                    for layer in range(self.config.num_hidden_layers)}, 
+                }
+            }
+        }
+        return partitioning_rules
+
+    
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: jax.Array,
+        max_length: int,
+        attention_mask: Optional[jax.Array] = None
+    ) -> dict:
+        """
+        Prepare inputs for generation by extending the attention mask and corresponding position IDs.
+        
+        Args:    
+            input_ids (jax.Array): Input token IDs of shape (batch_size, seq_len).
+            max_length (int): Maximum length of the sequence.
+            attention_mask (Optional[jax.Array]): Attention mask of shape (batch_size, seq_len).
+        Returns:
+            dict: Dictionary containing input_ids, attention_mask, and position_ids.
+        """
+        
+        batch_size, seq_length = input_ids.shape
+
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = extended_attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+        }
+    
+    def shard_parameters(
+        self,
+        device_mesh: Mesh,
+        params: FrozenDict,
+        rules: Optional[dict] = None):
+        """Apply sharding to loaded parameters based on partitioning rules."""
+        params = flatten_dict(unfreeze(params))
+        rules = rules if rules is not None else self.get_partitioning_rules()
+        rules = flatten_dict(rules)
+
+        sharded_params = {}
+
+        for param_key, param_value in params.items():
+            # Find the corresponding rule
+            rule_key = param_key  # Adjust if your rules have different structure
+            if rule_key in rules:
+                partition_spec = rules[rule_key]
+                
+                sharding = NamedSharding(device_mesh, partition_spec)
+                sharded_param = jax.device_put(param_value, sharding)
+                sharded_params[param_key] = sharded_param
+            else:
+                sharded_params[param_key] = param_value
+        
+        return freeze(unflatten_dict(sharded_params))
+
+    def shard_inputs(
+        self,
+        device_mesh: Mesh,
+        input_ids: Optional[jax.Array] = None,
+        attention_mask: Optional[jax.Array] = None,
+        position_ids: Optional[jax.Array] = None,
+    ) -> Tuple[jax.Array, ...]:
+        """
+        Shard inputs for the model based on the device mesh.
+        
+        Args:
+            device_mesh (Mesh): JAX device mesh for sharding.
+            input_ids (jax.Array): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (jax.Array): Attention mask of shape (batch_size, seq_len).
+            position_ids (jax.Array): Position IDs of shape (batch_size, seq_len).
+        Returns:
+            Tuple[jax.Array, ...]: Sharded given inputs as a tuple.
+        """
+        
+        sharding = NamedSharding(device_mesh, P('dp', None))
+        outputs = ()
+        
+        if input_ids is not None:
+            input_ids = jax.lax.with_sharding_constraint(input_ids, sharding)
+            outputs += (input_ids,)
+        if attention_mask is not None:
+            attention_mask = jax.lax.with_sharding_constraint(attention_mask, sharding)
+            outputs += (attention_mask,)
+        if position_ids is not None:
+            position_ids = jax.lax.with_sharding_constraint(position_ids, sharding)
+            outputs += (position_ids,)
+
+        return outputs
+
+    def generate(
+        self,
+        params: dict = None,
+        input_ids: jax.Array = None,
+        attention_mask: jax.Array = None,
+        position_ids: jax.Array = None,
+        max_new_tokens: int = 20,
+    ) -> jax.Array:
+        """
+        Generate causal tokens from input using JIT and Key&Value Caching in NN.
+        
+        Args:
+            params (dict): Flax parameters for the model.
+            input_ids (jax.Array): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (jax.Array): Attention mask of shape (batch_size, seq_len).
+            position_ids (jax.Array): Position IDs of shape (batch_size, seq_len).
+            max_new_tokens (int): Maximum number of new tokens to generate.
+        Returns:
+            
+            jax.Array: Generated token IDs of shape (batch_size, max_length).
+        """
+    
+        
+        batch_size, seq_len = input_ids.shape
+        max_len = seq_len + max_new_tokens
+        all_token_ids = jnp.zeros((batch_size, max_len), dtype=jnp.int32)
+
+        jit_apply = jax.jit(
+            self.model.apply,
+            static_argnames=('return_dict')
+        )
+
+
+        print(f"Initial pass for loading cache into model...")
+        outputs, cache = jit_apply(
+            params,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids[:, :seq_len],
+            return_dict=True,
+            mutable=['cache'],
+        )
+        params['cache'] = cache['cache']
+    
+        next_token_logits = outputs['logits'][:, -1, :]
+        next_token = jnp.argmax(next_token_logits, axis=-1)[:, None]
+        all_token_ids = lax.dynamic_update_slice(all_token_ids, next_token, (0, seq_len))
+        breakpoint()
+
+        while seq_len < max_len:
+            print("------", seq_len, "------") #just to track tokens
+            
+            outputs, cache = jit_apply(
+                params,
+                input_ids=next_token,  # Only process the new token
+                attention_mask=attention_mask,
+                position_ids = position_ids[:, seq_len].reshape(-1, 1),
+                return_dict=True,
+                mutable=['cache'],
+            )
+            params['cache'] = cache['cache']
+            next_token_logits = outputs['logits'][:, -1, :]
+            next_token = jnp.argmax(next_token_logits, axis=-1)[:, None]
+            if next_token == self.config.eos_token_id:
+                break
+            
+            all_token_ids = lax.dynamic_update_slice(all_token_ids, next_token, (0, seq_len))
+            seq_len += 1
+
+        return all_token_ids

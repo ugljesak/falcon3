@@ -4,7 +4,6 @@ import numpy as np
 import torch
 from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 from test.test_utils import compare_results
-from model.convert_hf_weights import torch_to_jnp
 
 def generate(
     model: FlaxFalcon3ForCausalLM = None,

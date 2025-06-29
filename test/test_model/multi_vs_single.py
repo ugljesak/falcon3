@@ -3,11 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoConfig
-from model.convert_hf_weights import make_model
 from model.generate_model import generate, jit_generate
-from model.convert_hf_weights import torch_to_jnp
 from model.jax_config import *
 from model.model_falcon3 import debug
+
 def debug_parameter_sharding(params, name="Parameters"):
     """Debug function to show parameter sharding information."""
     from flax.traverse_util import flatten_dict
@@ -34,6 +33,7 @@ def debug_parameter_sharding(params, name="Parameters"):
                 print(f"  Could not visualize: {e}")
     
     print("=" * 60)
+
 def init_model(config, torch_model, batch_size, max_len, rule):
     """
     Initialize the Flax model from the PyTorch model.
@@ -126,7 +126,7 @@ def run_test(model_name: str, prompt: str):
         num_hidden_layers=2,
         torch_dtype=torch.float32,
     )
-    partitioning_rules = get_partitioning_rules(config)
+    partitioning_rules = model.get_partitioning_rules(config)
 
     tokenizer, input_ids, attention_mask = tokenize(model_name, prompt)
     
@@ -173,9 +173,9 @@ def run_test(model_name: str, prompt: str):
         max_len=max_len,
     )
     
-    print("1️⃣ Flax model output:", outputs[0], sep='\n')
-    print("🔢 Torch model output:", sharded_outputs[0], sep='\n')
-    print("🈵 Decoding outputs...")
+    print("1️⃣  Flax model output:", outputs[0], sep='\n')
+    print("🔢  Torch model output:", sharded_outputs[0], sep='\n')
+    print("🈵  Decoding outputs...")
     result_single = tokenizer.decode(outputs[0], skip_special_tokens=False)
     result_multi = tokenizer.decode(sharded_outputs[0], skip_special_tokens=False)
 

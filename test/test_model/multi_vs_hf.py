@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from model.generate_model import generate, jit_generate
+from model.jax_config import create_device_mesh
+from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 
 def init_torch_model(model_name: str, config):
     """
@@ -17,16 +18,16 @@ def init_torch_model(model_name: str, config):
     )
     return torch_model
 
-def init_flax_model(config, torch_model, batch_size, max_len, rule):
+def init_flax_model(config, batch_size, max_len, checkpoint_path = None):
     """
     Initialize the Flax model from the PyTorch model.
     """
-    flax_model, flax_params = make_model(
+    flax_model = FlaxFalcon3ForCausalLM(config)
+    flax_params = flax_model.convert_from_hf_weights(
         config=config,
-        torch_model=torch_model,
+        checkpoint_path=checkpoint_path,
         batch_size=batch_size,
-        seq_len=max_len,
-        rule=rule
+        max_len=max_len
     )
     return flax_model, flax_params
 
@@ -43,8 +44,10 @@ def prepare_flax_input(flax_model, input_ids, attention_mask, max_len):
     """
     Prepare input for the Flax model.
     """
-    input_ids = torch_to_jnp(input_ids)
-    attention_mask = torch_to_jnp(attention_mask)
+    input_ids = jnp.array(input_ids.numpy())
+    input_ids = jnp.repeat(input_ids, 2, axis=0)  # Duplicate for batch size of 2
+    attention_mask = jnp.array(attention_mask.numpy())
+    attention_mask = jnp.repeat(attention_mask, 2, axis=0)
     inputs = flax_model.prepare_inputs_for_generation(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -60,10 +63,7 @@ def run_torch_model(torch_model, input_ids, attention_mask):
     outputs = torch_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        # return_dict_in_generate=True,
-        # output_hidden_states=True,
-        # output_attentions=True,
-        
+
     )
     return outputs
 
@@ -73,15 +73,14 @@ def run_flax_model(flax_params, flax_model, input_ids, attention_mask, position_
     """
     print("✍️ Generating Flax Model output...")
     _, seq_len = input_ids.shape
-    generated_ids = jit_generate(
+    token_ids = flax_model.generate(
         params=flax_params,
-        model=flax_model,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        max_new_tokens=max_len - seq_len,
+        max_new_tokens=max_len-seq_len,
     )
-    return generated_ids
+    return token_ids
 
 def strip_output(result, prompt: str = "") -> str:
     """
@@ -102,7 +101,6 @@ def compare_results(torch_result: str, flax_result: str) -> str:
         return "❌ Outputs do not match!"
 
 
-
 def run_test(model_name: str, prompt: str):
     """
     Run the test comparing Hugging Face and Flax models.
@@ -113,26 +111,31 @@ def run_test(model_name: str, prompt: str):
         num_hidden_layers=2,
         torch_dtype=torch.float32,
     )
-    breakpoint()  # Debugging point to inspect config
-    # config._attn_implementation = "eager"
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)
 
     torch_model = init_torch_model(model_name, config)
     torch_output = run_torch_model(torch_model, input_ids, attention_mask)
     max_len = torch_output.shape[1]
     
+    mesh = create_device_mesh(dp_size=2, tp_size=4)  # Adjust as needed for your setup
     flax_model, flax_params = init_flax_model(
         config=config,
-        torch_model=torch_model,
-        batch_size=input_ids.shape[0],
+        batch_size=input_ids.shape[0] * 2,
         max_len=max_len,
-        rule="hf"
+        checkpoint_path=None  # Path to the checkpoint if needed
     )
+    flax_params = flax_model.shard_parameters(mesh, flax_params)
     input_ids, attention_mask, position_ids = prepare_flax_input(
         flax_model=flax_model,
         input_ids=input_ids,
         attention_mask=attention_mask,
         max_len=max_len
+    )
+    input_ids, attention_mask, position_ids = flax_model.shard_inputs(
+        device_mesh=mesh,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids
     )
     print("🔄 Preparing inputs for Flax model...")
     print(f"Attention mask shape: {attention_mask.shape}")
