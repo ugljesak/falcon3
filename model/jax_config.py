@@ -12,7 +12,7 @@ from model.model_falcon3 import FlaxFalcon3ForCausalLM
 from model.configuration_falcon3 import Falcon3Config
 
 global DEVICE_COUNT
-DEVICE_COUNT = None  # Set the number of devices for parallelism
+
 
 def set_device_count(count):
     """Set the global device count for JAX."""
