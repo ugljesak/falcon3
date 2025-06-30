@@ -56,7 +56,7 @@ def run_test(model_name: str, prompt: str):
     torch_output = run_torch_model(torch_model, input_ids, attention_mask)
     
     torch_result = tokenizer.batch_decode(torch_output, skip_special_tokens=False)
-    print("🈵 Decoded output:", torch_result)
+    print("🈵 Decoded output:", torch_result[0])
 
 if __name__ == "__main__":
     torch_output = run_test(

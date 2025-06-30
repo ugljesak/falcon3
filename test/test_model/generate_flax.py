@@ -64,18 +64,24 @@ def run_flax_model(
     """
     print("✍️ Generating Flax Model output...")
     _, seq_len = input_ids.shape
-    token_ids = flax_model.generate(
+    jit_generate = jax.jit(
+        flax_model.generate,
+        static_argnames=('max_new_tokens', 'return_dict'),
+    )
+    
+    token_ids = jit_generate(
         params=flax_params,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         max_new_tokens=max_len-seq_len,
+        return_dict=True
     )
     return token_ids
 
 def main(model_name: str, prompt: str):
     # Example usage
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, num_hidden_layers=4, torch_dtype=torch.float32)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     inputs = tokenizer(prompt, return_tensors="pt")

@@ -85,7 +85,7 @@ def main(model_name: str, prompt: str):
     # Example usage
     config = AutoConfig.from_pretrained(model_name)
     config.num_hidden_layers = 4  # Set to a smaller number for testing
-    device_mesh = create_device_mesh(2, 4)
+    device_mesh = create_device_mesh(1, 8)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     inputs = tokenizer(prompt, return_tensors="pt")

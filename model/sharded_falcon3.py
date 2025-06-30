@@ -691,7 +691,8 @@ class FlaxFalcon3ForCausalLM():
         self,
         device_mesh: Mesh,
         params: FrozenDict,
-        rules: Optional[dict] = None):
+        rules: Optional[dict] = None
+    ) -> dict:
         """Apply sharding to loaded parameters based on partitioning rules."""
         params = flatten_dict(unfreeze(params))
         rules = rules if rules is not None else self.get_partitioning_rules()

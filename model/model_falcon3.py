@@ -17,6 +17,9 @@ from safetensors.flax import load_file
 from model.configuration_falcon3 import Falcon3Config
 
 def debug(tensor, name):
+    pass
+
+def _debug(tensor, name):
     """Enhanced debugging function to print sharding information."""
     print(f"\n=== Debugging {name} ===")
     print(f"Shape: {tensor.shape}")
