@@ -377,7 +377,6 @@ class FlaxFalcon3Model(nn.Module):
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
         hidden_states = outputs[0]
@@ -537,7 +536,7 @@ class FlaxFalcon3ForCausalLM():
         config: Falcon3Config,
         checkpoint_path: Union[str, Path],
         batch_size: int,
-        seq_len: int,
+        max_len: int,
     ) -> FrozenDict:
         """ 
         Convert weights from a Hugging Face checkpoint to a Flax model.
@@ -558,17 +557,16 @@ class FlaxFalcon3ForCausalLM():
         
         ckpt_paths = sorted(checkpoint_path.glob("*.safetensors"))
         ckpts = []
-        test_params = {}
         for ckpt_path in ckpt_paths:
             checkpoint = load_file(str(ckpt_path))
             ckpts.append(checkpoint)
-            test_params.update(checkpoint)
         
         def from_checkpoint(key, axis=0):
             weights = jnp.concatenate([ckpt[key] for ckpt in ckpts if key in ckpt], axis=axis) 
+            # Convert weights to float32 if they are bfloat16
+            if weights.dtype == jnp.bfloat16:
+                weights = weights.astype(jnp.float32)
             return weights
-
-        breakpoint()
 
         print(f"Loaded {len(ckpts)} checkpoints from {checkpoint_path}")
         flax_params = {
@@ -601,8 +599,8 @@ class FlaxFalcon3ForCausalLM():
                     'layers': {
                         f'{layer}': {
                             'self_attn': {
-                                'cached_key': jnp.zeros((batch_size, seq_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
-                                'cached_value': jnp.zeros((batch_size, seq_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
+                                'cached_key': jnp.zeros((batch_size, max_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
+                                'cached_value': jnp.zeros((batch_size, max_len, config.num_key_value_heads, config.head_dim), dtype=jnp.float32),
                                 'cache_index': jnp.array(0, dtype=jnp.int32), 
                             }
                         }
@@ -756,6 +754,7 @@ class FlaxFalcon3ForCausalLM():
         attention_mask: jax.Array = None,
         position_ids: jax.Array = None,
         max_new_tokens: int = 20,
+        return_dict: bool = True,
     ) -> jax.Array:
         """
         Generate causal tokens from input using JIT and Key&Value Caching in NN.
@@ -774,7 +773,8 @@ class FlaxFalcon3ForCausalLM():
         
         batch_size, seq_len = input_ids.shape
         max_len = seq_len + max_new_tokens
-        all_token_ids = jnp.zeros((batch_size, max_len), dtype=jnp.int32)
+
+        all_token_ids = input_ids.copy()
 
         jit_apply = jax.jit(
             self.model.apply,
@@ -783,39 +783,36 @@ class FlaxFalcon3ForCausalLM():
 
 
         print(f"Initial pass for loading cache into model...")
-        outputs, cache = jit_apply(
+        outputs, cache = self.model.apply(
             params,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids[:, :seq_len],
-            return_dict=True,
+            return_dict=return_dict,
             mutable=['cache'],
         )
         params['cache'] = cache['cache']
     
         next_token_logits = outputs['logits'][:, -1, :]
         next_token = jnp.argmax(next_token_logits, axis=-1)[:, None]
-        all_token_ids = lax.dynamic_update_slice(all_token_ids, next_token, (0, seq_len))
-        breakpoint()
+        all_token_ids = jnp.concatenate((all_token_ids, next_token), axis=1)
 
         while seq_len < max_len:
             print("------", seq_len, "------") #just to track tokens
             
-            outputs, cache = jit_apply(
+            outputs, cache = self.model.apply(
                 params,
                 input_ids=next_token,  # Only process the new token
                 attention_mask=attention_mask,
                 position_ids = position_ids[:, seq_len].reshape(-1, 1),
-                return_dict=True,
+                return_dict=return_dict,
                 mutable=['cache'],
             )
             params['cache'] = cache['cache']
-            next_token_logits = outputs['logits'][:, -1, :]
-            next_token = jnp.argmax(next_token_logits, axis=-1)[:, None]
-            if next_token == self.config.eos_token_id:
-                break
-            
-            all_token_ids = lax.dynamic_update_slice(all_token_ids, next_token, (0, seq_len))
             seq_len += 1
 
-        return all_token_ids
+            next_token_logits = outputs['logits'][:, -1, :]
+            next_token = jnp.argmax(next_token_logits, axis=-1)[:, None]
+            all_token_ids = jnp.concatenate((all_token_ids, next_token), axis=1)
+
+        return all_token_ids[:, :-1]

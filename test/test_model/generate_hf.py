@@ -47,7 +47,7 @@ def run_test(model_name: str, prompt: str):
     print("🪄  Initializing models...")
     config = AutoConfig.from_pretrained(
         model_name,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         torch_dtype=torch.float32,
     )
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)

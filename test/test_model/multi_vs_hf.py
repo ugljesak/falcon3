@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from flax.core import unfreeze, freeze
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
@@ -13,7 +14,7 @@ def init_torch_model(model_name: str, config):
     torch_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=config,
-        device_map="cpu",
+        device_map="auto",
         torch_dtype=torch.float32,
     )
     return torch_model
@@ -44,9 +45,9 @@ def prepare_flax_input(flax_model, input_ids, attention_mask, max_len):
     """
     Prepare input for the Flax model.
     """
-    input_ids = jnp.array(input_ids.numpy())
+    input_ids = jnp.array(input_ids.numpy(), dtype=jnp.int32)
     input_ids = jnp.repeat(input_ids, 2, axis=0)  # Duplicate for batch size of 2
-    attention_mask = jnp.array(attention_mask.numpy())
+    attention_mask = jnp.array(attention_mask.numpy(), dtype=jnp.int32)
     attention_mask = jnp.repeat(attention_mask, 2, axis=0)
     inputs = flax_model.prepare_inputs_for_generation(
         input_ids=input_ids,
@@ -73,12 +74,18 @@ def run_flax_model(flax_params, flax_model, input_ids, attention_mask, position_
     """
     print("✍️ Generating Flax Model output...")
     _, seq_len = input_ids.shape
-    token_ids = flax_model.generate(
+    jit_generate = jax.jit(
+        flax_model.generate,
+        static_argnames=('max_new_tokens', 'return_dict')
+    )
+    flax_params = unfreeze(flax_params)
+    token_ids = jit_generate(
         params=flax_params,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         max_new_tokens=max_len-seq_len,
+        return_dict=True,
     )
     return token_ids
 
@@ -108,7 +115,7 @@ def run_test(model_name: str, prompt: str):
     print("🪄  Initializing models...")
     config = AutoConfig.from_pretrained(
         model_name,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         torch_dtype=torch.float32,
     )
     tokenizer, input_ids, attention_mask = prepare_torch_input(model_name, prompt)

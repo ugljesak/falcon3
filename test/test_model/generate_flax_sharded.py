@@ -9,7 +9,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from model.sharded_falcon3 import FlaxFalcon3ForCausalLM
 from model.jax_config import shard_params, create_device_mesh, with_named_sharding_constraint
 from model.jax_config import with_named_sharding_constraint
-from . import *
 
 MODEL_NAME = "tiiuae/Falcon3-7B-Instruct"
 EXAMPLE_PROMPT = """
@@ -46,8 +45,6 @@ def prepare_flax_input(
     """
     Prepare input for the Flax model.
     """
-    input_ids = jnp.array(input_ids.numpy())
-    attention_mask = jnp.array(attention_mask.numpy())
     inputs = flax_model.prepare_inputs_for_generation(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -68,18 +65,26 @@ def run_flax_model(
     """
     print("✍️ Generating Flax Model output...")
     _, seq_len = input_ids.shape
-    token_ids = flax_model.generate(
+    
+    jit_generate = jax.jit(
+        flax_model.generate,
+        static_argnames=('max_new_tokens', 'return_dict')
+    )
+
+    token_ids = jit_generate(
         params=flax_params,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         max_new_tokens=max_len-seq_len,
+        return_dict=True
     )
     return token_ids
 
 def main(model_name: str, prompt: str):
     # Example usage
     config = AutoConfig.from_pretrained(model_name)
+    config.num_hidden_layers = 4  # Set to a smaller number for testing
     device_mesh = create_device_mesh(2, 4)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -88,6 +93,8 @@ def main(model_name: str, prompt: str):
     max_len = seq_len + 20
     # Just to test the sharding, we will use a batch size of 2
     batch_size = 2
+    inputs.input_ids = jnp.array(inputs.input_ids.numpy(), dtype=jnp.int32)
+    inputs.attention_mask = jnp.array(inputs.attention_mask.numpy(), dtype=jnp.int32)
     inputs.input_ids = jnp.repeat(inputs.input_ids, batch_size, axis=0)
     inputs.attention_mask = jnp.repeat(inputs.attention_mask, batch_size, axis=0)
 
@@ -108,7 +115,8 @@ def main(model_name: str, prompt: str):
     # input_ids = with_named_sharding_constraint(input_ids, device_mesh, P('dp', None))
     # attention_mask = with_named_sharding_constraint(attention_mask, device_mesh, P('dp', None))
     # position_ids = with_named_sharding_constraint(position_ids, device_mesh, P('dp', None))
-
+    from flax.core import unfreeze, freeze
+    flax_params = unfreeze(flax_params)
     generated_ids = run_flax_model(
         flax_params,
         flax_model,
